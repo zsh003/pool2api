@@ -1,4 +1,4 @@
-import { BarChart3 } from "lucide-react";
+import { BarChart3, Download } from "lucide-react";
 import { getTranslations } from "next-intl/server";
 import { getProviders } from "@/actions/providers";
 import { AutoSortPriorityDialog } from "@/app/[locale]/settings/providers/_components/auto-sort-priority-dialog";
@@ -49,6 +49,12 @@ export default async function DashboardProvidersPage({
               <Link href="/dashboard/leaderboard?scope=provider">
                 <BarChart3 className="h-4 w-4" />
                 {t("providers.section.leaderboard")}
+              </Link>
+            </Button>
+            <Button asChild variant="outline">
+              <Link href="/dashboard/providers/import">
+                <Download className="h-4 w-4" />
+                Import from cc-switch
               </Link>
             </Button>
             <AutoSortPriorityDialog />

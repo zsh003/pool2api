@@ -2,6 +2,8 @@
 FROM oven/bun:debian AS deps
 WORKDIR /app
 COPY package.json ./
+# better-sqlite3 requires native compilation: python3 + make + g++
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 RUN bun install
 
 FROM oven/bun:debian AS builder
