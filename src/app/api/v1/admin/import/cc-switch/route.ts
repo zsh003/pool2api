@@ -72,13 +72,19 @@ function parseCodexProvider(row: CcSwitchProvider): ParsedProvider | null {
 
     if (!baseUrl || !apiKey) return null;
 
+    // cc-switch codex providers declare their protocol via wire_api. "responses"
+    // means the Responses API (/v1/responses), which CC Hub models as the
+    // "codex" provider type; anything else is a plain Chat Completions upstream.
+    const wireApi = config.config?.match(/wire_api\s*=\s*"([^"]+)"/)?.[1];
+    const providerType = wireApi === "responses" ? "codex" : "openai-compatible";
+
     return {
       importId: row.id,
       appType: row.app_type,
       name: row.name,
       url: baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`,
       apiKey,
-      providerType: "openai-compatible",
+      providerType,
     };
   } catch {
     return null;
@@ -98,14 +104,21 @@ async function loadCcSwitchProviders(dbPath: string): Promise<ParsedProvider[]> 
          FROM providers p
          LEFT JOIN provider_endpoints e ON p.id = e.provider_id AND p.app_type = e.app_type
          WHERE p.app_type IN ('claude', 'codex')
-           AND p.category != 'official'`
+           AND (p.category IS NULL OR p.category != 'official')`
       )
       .all() as CcSwitchProvider[];
 
     const result: ParsedProvider[] = [];
+    // A provider may have multiple endpoints (LEFT JOIN fan-out); keep the first row per id
+    const seen = new Set<string>();
     for (const row of rows) {
+      const dedupeKey = `${row.app_type}:${row.id}`;
+      if (seen.has(dedupeKey)) continue;
       const parsed = row.app_type === "claude" ? parseClaudeProvider(row) : parseCodexProvider(row);
-      if (parsed) result.push(parsed);
+      if (parsed) {
+        seen.add(dedupeKey);
+        result.push(parsed);
+      }
     }
     return result;
   } finally {
@@ -200,7 +213,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
     for (const p of toImport) {
       try {
-        await createProvider({
+        const created = await createProvider({
           name: p.name,
           url: p.url,
           key: p.apiKey,
@@ -209,10 +222,10 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           rpm: null,
           rpd: null,
           cc: null,
-          // Pool metadata stored via direct db update after create
         });
 
-        // Update the pool metadata fields that createProvider doesn't expose
+        // Pool metadata is not part of CreateProviderData; set it on the row we
+        // just created, addressed by its own id (never by name, which is not unique).
         await db
           .update(providers)
           .set({
@@ -220,27 +233,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
             poolSource: "cc_switch_import",
             poolImportId: p.importId,
           })
-          .where(eq(providers.poolImportId, p.importId));
-
-        // Use name+url as a lookup since poolImportId was just set
-        // Re-find the newly created provider by name and url to set pool fields
-        const newProviders = await db
-          .select({ id: providers.id })
-          .from(providers)
-          .where(eq(providers.name, p.name))
-          .orderBy(providers.id)
-          .limit(1);
-
-        if (newProviders[0]) {
-          await db
-            .update(providers)
-            .set({
-              poolLabel: p.name,
-              poolSource: "cc_switch_import",
-              poolImportId: p.importId,
-            })
-            .where(eq(providers.id, newProviders[0].id));
-        }
+          .where(eq(providers.id, created.id));
 
         results.push({ name: p.name, success: true });
       } catch (err) {
