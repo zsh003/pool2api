@@ -3,13 +3,7 @@
 import { useEffect, useState } from "react";
 import { Download, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 
@@ -122,7 +116,9 @@ export default function CcSwitchImportClient() {
       {importResult && (
         <Card
           className={
-            importResult.failed === 0 ? "border-green-600/30 bg-green-500/5" : "border-destructive/30"
+            importResult.failed === 0
+              ? "border-green-600/30 bg-green-500/5"
+              : "border-destructive/30"
           }
         >
           <CardHeader>
@@ -161,7 +157,8 @@ export default function CcSwitchImportClient() {
         </Button>
         {data && (
           <span className="text-sm text-muted-foreground">
-            {data.total} providers found · {data.already_imported} already imported · {data.pending} pending
+            {data.total} providers found · {data.already_imported} already imported · {data.pending}{" "}
+            pending
           </span>
         )}
       </div>
@@ -173,7 +170,8 @@ export default function CcSwitchImportClient() {
               <div>
                 <CardTitle className="text-base">Pending import</CardTitle>
                 <CardDescription>
-                  {pendingProviders.length} provider{pendingProviders.length !== 1 ? "s" : ""} not yet imported
+                  {pendingProviders.length} provider{pendingProviders.length !== 1 ? "s" : ""} not
+                  yet imported
                 </CardDescription>
               </div>
               <div className="flex items-center gap-3">
@@ -208,7 +206,9 @@ export default function CcSwitchImportClient() {
                   <th className="w-10 px-4 py-2" />
                   <th className="px-4 py-2 text-left font-medium text-muted-foreground">Name</th>
                   <th className="px-4 py-2 text-left font-medium text-muted-foreground">Type</th>
-                  <th className="px-4 py-2 text-left font-medium text-muted-foreground hidden sm:table-cell">URL</th>
+                  <th className="px-4 py-2 text-left font-medium text-muted-foreground hidden sm:table-cell">
+                    URL
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -271,8 +271,8 @@ export default function CcSwitchImportClient() {
           <CardContent className="py-10 text-center text-sm text-muted-foreground">
             No providers found in the cc-switch database.
             <br />
-            Make sure <code className="font-mono">CC_SWITCH_DB_PATH</code> is set correctly (default:{" "}
-            <code className="font-mono">~/.cc-switch/cc-switch.db</code>).
+            Make sure <code className="font-mono">CC_SWITCH_DB_PATH</code> is set correctly
+            (default: <code className="font-mono">~/.cc-switch/cc-switch.db</code>).
           </CardContent>
         </Card>
       )}

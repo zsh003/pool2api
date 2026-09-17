@@ -6,11 +6,7 @@ import {
   hashPassword,
   setPortalAuthCookie,
 } from "@/lib/auth/account-auth";
-import {
-  createAccount,
-  findAccountByEmail,
-  findAccountByInviteToken,
-} from "@/repository/account";
+import { createAccount, findAccountByEmail, findAccountByInviteToken } from "@/repository/account";
 import { createUser } from "@/repository/user";
 
 export const runtime = "nodejs";

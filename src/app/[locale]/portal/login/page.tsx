@@ -85,7 +85,10 @@ export default function PortalLoginPage() {
             </Button>
             <p className="text-center text-sm text-muted-foreground">
               Don&apos;t have an account?{" "}
-              <a href="/portal/register" className="underline underline-offset-4 hover:text-foreground">
+              <a
+                href="/portal/register"
+                className="underline underline-offset-4 hover:text-foreground"
+              >
                 Register
               </a>
             </p>

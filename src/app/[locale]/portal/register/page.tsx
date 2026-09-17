@@ -122,7 +122,10 @@ export default function PortalRegisterPage() {
             </Button>
             <p className="text-center text-sm text-muted-foreground">
               Already have an account?{" "}
-              <a href="/portal/login" className="underline underline-offset-4 hover:text-foreground">
+              <a
+                href="/portal/login"
+                className="underline underline-offset-4 hover:text-foreground"
+              >
                 Sign in
               </a>
             </p>

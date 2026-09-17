@@ -104,8 +104,7 @@ async function loadCcSwitchProviders(dbPath: string): Promise<ParsedProvider[]> 
 
     const result: ParsedProvider[] = [];
     for (const row of rows) {
-      const parsed =
-        row.app_type === "claude" ? parseClaudeProvider(row) : parseCodexProvider(row);
+      const parsed = row.app_type === "claude" ? parseClaudeProvider(row) : parseCodexProvider(row);
       if (parsed) result.push(parsed);
     }
     return result;
@@ -161,7 +160,9 @@ export async function GET(request: NextRequest): Promise<NextResponse> {
       error: error instanceof Error ? error.message : String(error),
     });
     return NextResponse.json(
-      { error: `Failed to read cc-switch database: ${error instanceof Error ? error.message : String(error)}` },
+      {
+        error: `Failed to read cc-switch database: ${error instanceof Error ? error.message : String(error)}`,
+      },
       { status: 500 }
     );
   }
@@ -219,9 +220,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
             poolSource: "cc_switch_import",
             poolImportId: p.importId,
           })
-          .where(
-            eq(providers.poolImportId, p.importId)
-          );
+          .where(eq(providers.poolImportId, p.importId));
 
         // Use name+url as a lookup since poolImportId was just set
         // Re-find the newly created provider by name and url to set pool fields
@@ -249,7 +248,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
           name: p.name,
           error: err instanceof Error ? err.message : String(err),
         });
-        results.push({ name: p.name, success: false, error: err instanceof Error ? err.message : String(err) });
+        results.push({
+          name: p.name,
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
 

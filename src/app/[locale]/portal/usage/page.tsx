@@ -59,7 +59,10 @@ export default function PortalUsagePage() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">Usage Logs</h1>
-        <a href="/portal/keys" className="text-sm text-muted-foreground hover:text-foreground underline underline-offset-4">
+        <a
+          href="/portal/keys"
+          className="text-sm text-muted-foreground hover:text-foreground underline underline-offset-4"
+        >
           Back to keys
         </a>
       </div>
@@ -84,11 +87,21 @@ export default function PortalUsagePage() {
                   <tr className="border-b bg-muted/40">
                     <th className="px-4 py-2 text-left font-medium text-muted-foreground">Time</th>
                     <th className="px-4 py-2 text-left font-medium text-muted-foreground">Model</th>
-                    <th className="px-4 py-2 text-right font-medium text-muted-foreground tabular-nums">In tokens</th>
-                    <th className="px-4 py-2 text-right font-medium text-muted-foreground tabular-nums">Out tokens</th>
-                    <th className="px-4 py-2 text-right font-medium text-muted-foreground tabular-nums">Cost</th>
-                    <th className="px-4 py-2 text-right font-medium text-muted-foreground tabular-nums">Status</th>
-                    <th className="px-4 py-2 text-right font-medium text-muted-foreground tabular-nums">Duration</th>
+                    <th className="px-4 py-2 text-right font-medium text-muted-foreground tabular-nums">
+                      In tokens
+                    </th>
+                    <th className="px-4 py-2 text-right font-medium text-muted-foreground tabular-nums">
+                      Out tokens
+                    </th>
+                    <th className="px-4 py-2 text-right font-medium text-muted-foreground tabular-nums">
+                      Cost
+                    </th>
+                    <th className="px-4 py-2 text-right font-medium text-muted-foreground tabular-nums">
+                      Status
+                    </th>
+                    <th className="px-4 py-2 text-right font-medium text-muted-foreground tabular-nums">
+                      Duration
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -98,8 +111,12 @@ export default function PortalUsagePage() {
                         {log.createdAt ? new Date(log.createdAt).toLocaleString() : "-"}
                       </td>
                       <td className="px-4 py-2 font-mono text-xs">{log.model ?? "-"}</td>
-                      <td className="px-4 py-2 text-right tabular-nums">{log.inputTokens ?? "-"}</td>
-                      <td className="px-4 py-2 text-right tabular-nums">{log.outputTokens ?? "-"}</td>
+                      <td className="px-4 py-2 text-right tabular-nums">
+                        {log.inputTokens ?? "-"}
+                      </td>
+                      <td className="px-4 py-2 text-right tabular-nums">
+                        {log.outputTokens ?? "-"}
+                      </td>
                       <td className="px-4 py-2 text-right tabular-nums">
                         {log.costUsd != null ? `$${Number(log.costUsd).toFixed(6)}` : "-"}
                       </td>

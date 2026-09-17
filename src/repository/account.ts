@@ -24,11 +24,7 @@ export async function findAccountByEmail(email: string): Promise<Account | undef
 }
 
 export async function findAccountById(id: number): Promise<Account | undefined> {
-  const rows = await db
-    .select()
-    .from(accounts)
-    .where(eq(accounts.id, id))
-    .limit(1);
+  const rows = await db.select().from(accounts).where(eq(accounts.id, id)).limit(1);
   return rows[0];
 }
 
@@ -59,10 +55,6 @@ export async function updateAccountLinkedUser(
 }
 
 export async function findAccountByInviteToken(token: string): Promise<Account | undefined> {
-  const rows = await db
-    .select()
-    .from(accounts)
-    .where(eq(accounts.inviteToken, token))
-    .limit(1);
+  const rows = await db.select().from(accounts).where(eq(accounts.inviteToken, token)).limit(1);
   return rows[0];
 }

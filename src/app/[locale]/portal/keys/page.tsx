@@ -3,13 +3,7 @@
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
@@ -115,7 +109,10 @@ export default function PortalKeysPage() {
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">My API Keys</h1>
         <div className="flex items-center gap-3">
-          <a href="/portal/usage" className="text-sm text-muted-foreground hover:text-foreground underline underline-offset-4">
+          <a
+            href="/portal/usage"
+            className="text-sm text-muted-foreground hover:text-foreground underline underline-offset-4"
+          >
             Usage logs
           </a>
           <Button variant="outline" size="sm" onClick={handleLogout}>
