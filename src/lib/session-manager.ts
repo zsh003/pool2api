@@ -1,0 +1,3877 @@
+import "server-only";
+
+import { Buffer } from "node:buffer";
+import crypto from "node:crypto";
+import { extractCodexSessionId } from "@/app/v1/_lib/codex/session-extractor";
+import { sanitizeHeaders, sanitizeUrl } from "@/app/v1/_lib/proxy/errors";
+import { RESERVED_INTERNAL_HEADERS } from "@/app/v1/_lib/responses-ws/internal-secret";
+import { parseClaudeMetadataUserId } from "@/lib/claude-code/metadata-user-id";
+import { getEnvConfig } from "@/lib/config/env.schema";
+import { logger } from "@/lib/logger";
+import {
+  getSessionRequestArtifactByteSize,
+  getSessionRequestArtifactMaxBytes,
+} from "@/lib/session-request-artifact-limit";
+import {
+  redactMessages,
+  redactRequestBody,
+  redactResponseBody,
+} from "@/lib/utils/message-redaction";
+import { normalizeRequestSequence } from "@/lib/utils/request-sequence";
+import type {
+  ActiveSessionInfo,
+  SessionDetailRequestMeta,
+  SessionDetailRequestSnapshot,
+  SessionDetailResponseMeta,
+  SessionDetailResponseSnapshot,
+  SessionDetailViewMode,
+  SessionProviderInfo,
+  SessionStoreInfo,
+  SessionUsageUpdate,
+} from "@/types/session";
+import type { SpecialSetting } from "@/types/special-settings";
+import { getRedisClient } from "./redis";
+import {
+  getGlobalActiveSessionsKey,
+  getKeyActiveSessionsKey,
+  getUserActiveSessionsKey,
+} from "./redis/active-session-keys";
+import {
+  acquireSessionDiscoveryLease as acquireVersionedSessionDiscoveryLease,
+  buildSessionBindingKeys,
+  clearSessionBinding as clearVersionedSessionBinding,
+  compareAndSetSessionBinding,
+  ensureVersionedBindingCapability,
+  mutateLegacySessionBindingSafely,
+  readOrReconcileSessionBinding,
+  isSessionProviderCoolingDown as readSessionProviderCooldown,
+  getVersionedBindingCapabilityState as readVersionedBindingCapabilityState,
+  releaseSessionDiscoveryLease as releaseVersionedSessionDiscoveryLease,
+  renewSessionDiscoveryLease as renewVersionedSessionDiscoveryLease,
+  type SessionBindingResult,
+  type SessionBindingSnapshot,
+  type SessionBindingUnavailableResult,
+  type SessionDiscoveryLeaseAcquireResult,
+  type SessionDiscoveryLeaseMutationResult,
+  type SessionProviderCooldownResult,
+  terminateSessionBinding as terminateVersionedSessionBinding,
+  touchSessionBinding,
+  type VersionedBindingCapabilityState,
+} from "./redis/session-binding";
+import { SessionTracker } from "./session-tracker";
+
+const RESERVED_INTERNAL_HEADER_SET = new Set(
+  RESERVED_INTERNAL_HEADERS.map((header) => header.toLowerCase())
+);
+const DEFAULT_SESSION_RESPONSE_BODY_MAX_BYTES = 5 * 1024 * 1024;
+const SESSION_RESPONSE_BODY_VIEWS = ["legacy", "before", "after"] as const;
+const WRITE_SESSION_RESPONSE_BODY_BUNDLE_LUA = `
+-- cch:session-response-bundle:write:v1
+local expected_key_id = ARGV[2]
+if expected_key_id ~= "" then
+  if redis.call("GET", KEYS[8]) ~= expected_key_id then
+    return 0
+  end
+  local current_generation = redis.call("GET", KEYS[6])
+  local request_generation = redis.call("GET", KEYS[7])
+  if not current_generation or not request_generation or current_generation ~= request_generation then
+    return 0
+  end
+end
+
+redis.call("DEL", KEYS[1], KEYS[2], KEYS[3], KEYS[4])
+redis.call(
+  "HSET",
+  KEYS[1],
+  "schema", "1",
+  "layout", "dedup",
+  "total_bytes", ARGV[3],
+  "over_budget", ARGV[4]
+)
+
+local views = { "legacy", "before", "after" }
+for index, view in ipairs(views) do
+  if ARGV[index + 4] == "1" then
+    redis.call("HSET", KEYS[1], "present:" .. view, "1")
+  end
+  local ref = ARGV[index + 7]
+  if ref ~= "" then
+    redis.call("HSET", KEYS[1], "ref:" .. view, ref)
+  end
+end
+
+for index = 11, #ARGV do
+  redis.call("HSET", KEYS[1], "body:" .. (index - 11), ARGV[index])
+end
+
+redis.call("EXPIRE", KEYS[1], ARGV[1])
+if expected_key_id ~= "" then
+  redis.call("EXPIRE", KEYS[6], ARGV[1])
+  redis.call("EXPIRE", KEYS[7], ARGV[1])
+end
+local redis_time = redis.call("TIME")
+local now_ms = (tonumber(redis_time[1]) * 1000) + math.floor(tonumber(redis_time[2]) / 1000)
+local expires_at_ms = now_ms + (tonumber(ARGV[1]) * 1000)
+redis.call("ZREMRANGEBYSCORE", KEYS[5], "-inf", now_ms)
+redis.call("ZADD", KEYS[5], expires_at_ms, KEYS[1])
+redis.call("EXPIRE", KEYS[5], ARGV[1])
+return 1
+`;
+const WRITE_LEGACY_SESSION_RESPONSE_BODY_SET_LUA = `
+-- cch:session-response-bundle:write-legacy:v1
+local expected_key_id = ARGV[2]
+if expected_key_id ~= "" then
+  if redis.call("GET", KEYS[8]) ~= expected_key_id then
+    return 0
+  end
+  local current_generation = redis.call("GET", KEYS[6])
+  local request_generation = redis.call("GET", KEYS[7])
+  if not current_generation or not request_generation or current_generation ~= request_generation then
+    return 0
+  end
+end
+
+redis.call("DEL", KEYS[1], KEYS[2], KEYS[3], KEYS[4])
+redis.call("HSET", KEYS[1], "schema", "1", "layout", "legacy")
+
+local views = { "legacy", "before", "after" }
+for index, view in ipairs(views) do
+  local offset = 3 + ((index - 1) * 3)
+  if ARGV[offset] == "1" then
+    redis.call("HSET", KEYS[1], "present:" .. view, "1")
+  end
+  if ARGV[offset + 1] == "1" then
+    redis.call("SETEX", KEYS[index + 1], ARGV[1], ARGV[offset + 2])
+  end
+end
+
+redis.call("EXPIRE", KEYS[1], ARGV[1])
+if expected_key_id ~= "" then
+  redis.call("EXPIRE", KEYS[6], ARGV[1])
+  redis.call("EXPIRE", KEYS[7], ARGV[1])
+end
+local redis_time = redis.call("TIME")
+local now_ms = (tonumber(redis_time[1]) * 1000) + math.floor(tonumber(redis_time[2]) / 1000)
+local expires_at_ms = now_ms + (tonumber(ARGV[1]) * 1000)
+redis.call("ZREMRANGEBYSCORE", KEYS[5], "-inf", now_ms)
+redis.call("ZADD", KEYS[5], expires_at_ms, KEYS[1])
+redis.call("EXPIRE", KEYS[5], ARGV[1])
+return 1
+`;
+const DELETE_SESSION_RESPONSE_BODY_BUNDLES_LUA = `
+-- cch:session-response-bundle:delete-session:v1
+local bundle_keys = redis.call("ZRANGE", KEYS[1], 0, -1)
+local deleted = redis.call("DEL", KEYS[1])
+redis.call("SETEX", KEYS[2], ARGV[1], ARGV[2])
+deleted = deleted + redis.call("DEL", KEYS[3], KEYS[4], KEYS[5])
+
+local bundle_suffix = "response-bodies:v1"
+for _, bundle_key in ipairs(bundle_keys) do
+  if string.sub(bundle_key, -string.len(bundle_suffix)) == bundle_suffix then
+    local request_prefix = string.sub(bundle_key, 1, string.len(bundle_key) - string.len(bundle_suffix))
+    deleted = deleted + redis.call(
+      "DEL",
+      bundle_key,
+      request_prefix .. "response",
+      request_prefix .. "snapshot:response:before:body",
+      request_prefix .. "snapshot:response:after:body",
+      request_prefix .. "response-body-generation:v1"
+    )
+  else
+    deleted = deleted + redis.call("DEL", bundle_key)
+  end
+end
+return deleted
+`;
+const READ_SESSION_RESPONSE_BODY_BUNDLE_LUA = `
+-- cch:session-response-bundle:read:v1
+if redis.call("EXISTS", KEYS[1]) == 0 then
+  local legacy = redis.call("GET", KEYS[2])
+  return { 0, legacy and 1 or 0, legacy or false }
+end
+
+local view = ARGV[1]
+local present = redis.call("HGET", KEYS[1], "present:" .. view)
+if redis.call("HGET", KEYS[1], "layout") == "legacy" then
+  return { 1, present and 1 or 0, redis.call("GET", KEYS[2]) or false }
+end
+
+local ref = redis.call("HGET", KEYS[1], "ref:" .. view)
+if not ref then
+  return { 1, present and 1 or 0, false }
+end
+return { 1, present and 1 or 0, redis.call("HGET", KEYS[1], "body:" .. ref) or false }
+`;
+
+type SessionResponseBodyView = (typeof SESSION_RESPONSE_BODY_VIEWS)[number];
+export type SessionResponseBodySetInput = Partial<Record<SessionResponseBodyView, string | null>>;
+
+type PreparedSessionResponseBodyBundle = {
+  bodies: string[];
+  byteSize: number;
+  overBudget: boolean;
+  present: Record<SessionResponseBodyView, boolean>;
+  refs: Record<SessionResponseBodyView, string>;
+};
+
+type SessionResponseBodyBundleRead = {
+  body: string | null;
+  exists: boolean;
+  present: boolean;
+};
+
+type PreparedLegacySessionResponseBodySet = {
+  bodies: Record<SessionResponseBodyView, string | null>;
+  present: Record<SessionResponseBodyView, boolean>;
+};
+
+function getSessionResponseBodyMaxBytes(): number {
+  const configuredMaxBytes = getEnvConfig().SESSION_RESPONSE_BODY_MAX_BYTES;
+  return Number.isSafeInteger(configuredMaxBytes) && configuredMaxBytes > 0
+    ? configuredMaxBytes
+    : DEFAULT_SESSION_RESPONSE_BODY_MAX_BYTES;
+}
+
+function canStoreSessionResponseBody(value: string, context: string): boolean {
+  const maxBytes = getSessionResponseBodyMaxBytes();
+  const byteSize = Buffer.byteLength(value, "utf8");
+  if (byteSize <= maxBytes) return true;
+
+  logger.warn("SessionManager: Skipped oversized session response body", {
+    context,
+    byteSize,
+    maxBytes,
+  });
+  return false;
+}
+
+function canStoreSessionRequestArtifact(value: unknown, context: string): boolean {
+  const byteSize = getSessionRequestArtifactByteSize(value);
+  const maxBytes = getSessionRequestArtifactMaxBytes();
+  if (byteSize <= maxBytes) return true;
+
+  logger.warn("SessionManager: Skipped oversized session request artifact", {
+    context,
+    byteSize,
+    maxBytes,
+  });
+  return false;
+}
+
+function normalizeSessionResponseBody(value: string | object, storeMessages: boolean): string {
+  if (storeMessages) return typeof value === "string" ? value : JSON.stringify(value);
+  if (typeof value === "object") return JSON.stringify(redactResponseBody(value));
+
+  try {
+    return JSON.stringify(redactResponseBody(JSON.parse(value) as unknown));
+  } catch {
+    return value;
+  }
+}
+
+function buildSessionResponseBodyBundleKey(sessionId: string, sequence: number): string {
+  return `session:${sessionId}:req:${sequence}:response-bodies:v1`;
+}
+
+function buildSessionResponseBodyBundleIndexKey(sessionId: string): string {
+  return `session:${sessionId}:response-body-bundles:v1`;
+}
+
+function buildSessionResponseBodyGenerationKey(sessionId: string): string {
+  return `session:${sessionId}:response-body-generation:v1`;
+}
+
+function buildSessionRequestResponseBodyGenerationKey(sessionId: string, sequence: number): string {
+  return `session:${sessionId}:req:${sequence}:response-body-generation:v1`;
+}
+
+function buildLegacySessionResponseBodyViewKey(
+  sessionId: string,
+  sequence: number,
+  view: SessionResponseBodyView
+): string {
+  if (view === "legacy") return `session:${sessionId}:req:${sequence}:response`;
+  return buildSessionDetailSnapshotKey(sessionId, sequence, "response", view, "body");
+}
+
+function prepareSessionResponseBodyBundle(
+  input: SessionResponseBodySetInput,
+  storeMessages: boolean
+): PreparedSessionResponseBodyBundle {
+  const bodies: string[] = [];
+  const bodyIndexes = new Map<string, string>();
+  const refs = { legacy: "", before: "", after: "" };
+  const present = { legacy: false, before: false, after: false };
+  let byteSize = 0;
+
+  for (const view of SESSION_RESPONSE_BODY_VIEWS) {
+    const value = input[view];
+    if (value === undefined || value === null) continue;
+    present[view] = true;
+    const normalized = normalizeSessionResponseBody(value, storeMessages);
+    let ref = bodyIndexes.get(normalized);
+    if (ref === undefined) {
+      ref = String(bodies.length);
+      bodyIndexes.set(normalized, ref);
+      bodies.push(normalized);
+      byteSize += Buffer.byteLength(normalized, "utf8");
+    }
+    refs[view] = ref;
+  }
+
+  const overBudget = byteSize > getSessionResponseBodyMaxBytes();
+  return {
+    bodies: overBudget ? [] : bodies,
+    byteSize,
+    overBudget,
+    present,
+    refs: overBudget ? { legacy: "", before: "", after: "" } : refs,
+  };
+}
+
+function prepareLegacySessionResponseBodySet(
+  input: SessionResponseBodySetInput,
+  storeMessages: boolean
+): PreparedLegacySessionResponseBodySet {
+  const bodies: Record<SessionResponseBodyView, string | null> = {
+    legacy: null,
+    before: null,
+    after: null,
+  };
+  const present = { legacy: false, before: false, after: false };
+
+  for (const view of SESSION_RESPONSE_BODY_VIEWS) {
+    const value = input[view];
+    if (value === undefined || value === null) continue;
+    present[view] = true;
+    const normalized = normalizeSessionResponseBody(value, storeMessages);
+    if (canStoreSessionResponseBody(normalized, `response:${view}`)) {
+      bodies[view] = normalized;
+    }
+  }
+
+  return { bodies, present };
+}
+
+async function readSessionResponseBodyBundleView(
+  redis: NonNullable<ReturnType<typeof getRedisClient>>,
+  sessionId: string,
+  sequence: number,
+  view: SessionResponseBodyView
+): Promise<SessionResponseBodyBundleRead> {
+  const result = (await redis.eval(
+    READ_SESSION_RESPONSE_BODY_BUNDLE_LUA,
+    2,
+    buildSessionResponseBodyBundleKey(sessionId, sequence),
+    buildLegacySessionResponseBodyViewKey(sessionId, sequence, view),
+    view
+  )) as unknown;
+  if (!Array.isArray(result) || result.length < 3) {
+    throw new Error("invalid session response body bundle read result");
+  }
+
+  return {
+    exists: Number(result[0]) === 1,
+    present: Number(result[1]) === 1,
+    body: typeof result[2] === "string" ? result[2] : null,
+  };
+}
+
+function isReservedInternalHeader(name: string): boolean {
+  const lowerName = name.toLowerCase();
+  return lowerName.startsWith("x-cch-") || RESERVED_INTERNAL_HEADER_SET.has(lowerName);
+}
+
+function redisUnavailableBindingResult(): SessionBindingUnavailableResult {
+  return {
+    status: "unavailable",
+    reason: "redis_not_ready",
+    capabilityState: readVersionedBindingCapabilityState(),
+    legacyFallbackAllowed: true,
+  };
+}
+
+/**
+ * 将已脱敏的 header 文本解析为可序列化对象（用于写入 Session 元信息）。
+ */
+function headersToSanitizedObject(headers: Headers): Record<string, string> {
+  const sanitizedText = sanitizeHeaders(headers);
+  if (!sanitizedText || sanitizedText === "(empty)") {
+    return {};
+  }
+
+  const obj: Record<string, string> = {};
+  const lines = sanitizedText.split(/\r?\n/).filter(Boolean);
+  for (const line of lines) {
+    const colonIndex = line.indexOf(":");
+    if (colonIndex === -1) continue;
+    const name = line.slice(0, colonIndex).trim();
+    const value = line.slice(colonIndex + 1).trim();
+    if (!name) continue;
+
+    if (obj[name]) {
+      obj[name] = `${obj[name]}\n${value}`;
+    } else {
+      obj[name] = value;
+    }
+  }
+
+  return obj;
+}
+
+/**
+ * 解析存储在 Redis 中的 header JSON 字符串。
+ *
+ * - 成功返回 `{ [name]: value }`
+ * - 解析失败/结构不合法则返回 null
+ */
+function parseHeaderRecord(value: string): Record<string, string> | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+
+    const record: Record<string, string> = {};
+    for (const [key, raw] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof raw === "string" && !isReservedInternalHeader(key)) {
+        record[key] = raw;
+      }
+    }
+    return record;
+  } catch (error) {
+    logger.warn("SessionManager: Failed to parse header record JSON", { error });
+    return null;
+  }
+}
+
+type SessionRequestMeta = {
+  url: string;
+  method: string;
+};
+
+type SessionResponseMeta = {
+  url: string;
+  statusCode: number;
+};
+
+type SessionDetailSnapshotKind = "request" | "response";
+type SessionDetailSnapshotField = "body" | "messages" | "headers" | "meta";
+type SessionDetailSnapshotHeadersInput = Headers | Record<string, string> | null;
+type SessionDetailRequestSnapshotInput = Omit<Partial<SessionDetailRequestSnapshot>, "headers"> & {
+  headers?: SessionDetailSnapshotHeadersInput;
+};
+type SessionDetailResponseSnapshotInput = Omit<
+  Partial<SessionDetailResponseSnapshot>,
+  "headers"
+> & {
+  headers?: SessionDetailSnapshotHeadersInput;
+};
+
+function buildSessionDetailSnapshotKey(
+  sessionId: string,
+  sequence: number,
+  kind: SessionDetailSnapshotKind,
+  phase: SessionDetailViewMode,
+  field: SessionDetailSnapshotField
+): string {
+  return `session:${sessionId}:req:${sequence}:snapshot:${kind}:${phase}:${field}`;
+}
+
+function normalizeSnapshotHeaders(
+  headers: Headers | Record<string, string> | null | undefined
+): Record<string, string> | null {
+  if (headers == null) return null;
+
+  if (headers instanceof Headers) {
+    const normalized = headersToSanitizedObject(headers);
+    return Object.keys(normalized).length > 0 ? normalized : null;
+  }
+
+  const normalized = Object.fromEntries(
+    Object.entries(headers).filter(
+      ([key, value]) => typeof value === "string" && !isReservedInternalHeader(key)
+    )
+  );
+  return Object.keys(normalized).length > 0 ? normalized : null;
+}
+
+function parseJsonStringIfPossible(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return value;
+  }
+}
+
+function parseSessionDetailRequestMeta(value: string): SessionDetailRequestMeta | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const obj = parsed as Record<string, unknown>;
+    return {
+      clientUrl: typeof obj.clientUrl === "string" ? obj.clientUrl : null,
+      upstreamUrl: typeof obj.upstreamUrl === "string" ? obj.upstreamUrl : null,
+      method: typeof obj.method === "string" ? obj.method : null,
+    };
+  } catch (error) {
+    logger.error("SessionManager: Failed to parse request detail snapshot meta", { error });
+    return null;
+  }
+}
+
+function parseSessionDetailResponseMeta(value: string): SessionDetailResponseMeta | null {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+
+    const obj = parsed as Record<string, unknown>;
+    return {
+      upstreamUrl: typeof obj.upstreamUrl === "string" ? obj.upstreamUrl : null,
+      statusCode: typeof obj.statusCode === "number" ? obj.statusCode : null,
+    };
+  } catch (error) {
+    logger.error("SessionManager: Failed to parse response detail snapshot meta", { error });
+    return null;
+  }
+}
+
+function buildTenantContentHashSessionKey(keyId: number, contentHash: string): string {
+  return `hash:${keyId}:${contentHash}:session`;
+}
+
+/**
+ * Session 管理器
+ *
+ * 核心功能：
+ * 1. 基于 messages 内容哈希识别 session
+ * 2. 管理 session 与 provider 的绑定关系
+ * 3. 支持客户端主动传递 session_id
+ * 4. 存储和查询活跃 session 详细信息（用于实时监控）
+ */
+export class SessionManager {
+  private static readonly SESSION_TTL = parseInt(process.env.SESSION_TTL || "300", 10); // 5 分钟
+  /**
+   * 获取 STORE_SESSION_MESSAGES 配置
+   * - true：原样存储 message 内容
+   * - false（默认）：存储但对 message 内容脱敏 [REDACTED]
+   */
+  private static get STORE_MESSAGES(): boolean {
+    return getEnvConfig().STORE_SESSION_MESSAGES;
+  }
+
+  /**
+   * 从客户端请求中提取 session_id（支持 metadata 或 header）
+   *
+   * 优先级:
+   * 1. metadata.user_id (Claude Code 主要方式，兼容旧字符串格式和新 JSON 字符串格式)
+   * 2. metadata.session_id (备选方式)
+   */
+  static extractClientSessionId(
+    requestMessage: Record<string, unknown>,
+    headers?: Headers | null,
+    _userAgent?: string | null
+  ): string | null {
+    // Codex 请求：优先尝试从 headers/body 提取稳定的 session_id
+    if (headers && Array.isArray(requestMessage.input)) {
+      const result = extractCodexSessionId(headers, requestMessage);
+      if (result.sessionId) {
+        logger.trace("SessionManager: Extracted session from Codex request", {
+          sessionId: result.sessionId,
+          source: result.source,
+        });
+        return result.sessionId;
+      }
+
+      return null;
+    }
+
+    const metadata = requestMessage.metadata;
+    if (!metadata || typeof metadata !== "object") {
+      return null;
+    }
+
+    const metadataObj = metadata as Record<string, unknown>;
+
+    // 方案 A: 从 metadata.user_id 中提取 (Claude Code 主要方式)
+    const extractedFromUserId = parseClaudeMetadataUserId(metadataObj.user_id);
+    if (extractedFromUserId.sessionId) {
+      logger.trace("SessionManager: Extracted session from metadata.user_id", {
+        sessionId: extractedFromUserId.sessionId,
+        format: extractedFromUserId.format,
+      });
+      return extractedFromUserId.sessionId;
+    }
+
+    // 方案 B: 直接从 metadata.session_id 读取 (备选方案)
+    if (typeof metadataObj.session_id === "string" && metadataObj.session_id.length > 0) {
+      logger.trace("SessionManager: Extracted session from metadata.session_id", {
+        sessionId: metadataObj.session_id,
+      });
+      return metadataObj.session_id;
+    }
+
+    return null;
+  }
+
+  /**
+   * 生成新的 session_id
+   * 格式：sess_{timestamp}_{random}
+   */
+  static generateSessionId(): string {
+    const timestamp = Date.now().toString(36);
+    const random = crypto.randomBytes(6).toString("hex");
+    return `sess_${timestamp}_${random}`;
+  }
+
+  private static async proveContentHashSessionOwnership(
+    redis: NonNullable<ReturnType<typeof getRedisClient>>,
+    sessionId: string,
+    keyId: number
+  ): Promise<{ owned: boolean; ownerPresent: boolean }> {
+    const legacyOwner = await redis.get(`session:${sessionId}:key`);
+    if (legacyOwner !== keyId.toString()) {
+      return { owned: false, ownerPresent: legacyOwner !== null };
+    }
+
+    // Reconcile only after the legacy owner proves the tenant. This both
+    // validates canonical/mirror consistency and refreshes the complete binding
+    // TTL, preventing an owner-expiry race between hash lookup and Provider selection.
+    const binding = await readOrReconcileSessionBinding({
+      sessionId,
+      keyId,
+      ttlSeconds: SessionManager.SESSION_TTL,
+      redis,
+    });
+    if (binding.status === "ok") {
+      return { owned: true, ownerPresent: true };
+    }
+    if (!binding.legacyFallbackAllowed) {
+      return { owned: false, ownerPresent: true };
+    }
+
+    const legacyRefresh = await mutateLegacySessionBindingSafely({
+      sessionId,
+      keyId,
+      ttlSeconds: SessionManager.SESSION_TTL,
+      redis,
+      mutation: { type: "refresh" },
+    });
+    return { owned: legacyRefresh.status === "ok", ownerPresent: true };
+  }
+
+  /**
+   * 获取 Session 内下一个请求序号（原子操作）
+   *
+   * 使用 Redis INCR 保证并发安全，序号从 1 开始递增
+   * 每个请求在同一 Session 内获得唯一序号，用于独立存储 messages
+   *
+   * @param sessionId - Session ID
+   * @returns 请求序号（从 1 开始），Redis 不可用时返回基于时间戳的唯一序号
+   */
+  static async getNextRequestSequence(sessionId: string, keyId: number): Promise<number> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") {
+      // 改进的 fallback：使用时间戳 + 随机数生成伪唯一序号
+      // 避免 Redis 不可用时所有请求都返回 1 导致的冲突
+      const fallbackSeq = (Date.now() % 1000000) + Math.floor(Math.random() * 1000);
+      logger.warn("SessionManager: Redis not ready, using fallback sequence", {
+        sessionId,
+        fallbackSeq,
+      });
+      return fallbackSeq;
+    }
+
+    try {
+      const key = `session:${sessionId}:seq`;
+      const rawSequence = await redis.eval(
+        `
+          local sequence = redis.call('INCR', KEYS[1])
+          redis.call('PERSIST', KEYS[1])
+          local generation = redis.call('GET', KEYS[2])
+          if not generation then
+            generation = '0'
+            redis.call('SETEX', KEYS[2], ARGV[2], generation)
+          else
+            redis.call('EXPIRE', KEYS[2], ARGV[2])
+          end
+          local ownerKey = ARGV[1] .. sequence .. ':owner'
+          local requestGenerationKey = ARGV[1] .. sequence .. ':response-body-generation:v1'
+          redis.call('SETEX', ownerKey, ARGV[2], ARGV[3])
+          redis.call('SETEX', requestGenerationKey, ARGV[2], generation)
+          return sequence
+        `,
+        2,
+        key,
+        buildSessionResponseBodyGenerationKey(sessionId),
+        `session:${sessionId}:req:`,
+        String(SessionManager.SESSION_TTL),
+        String(keyId)
+      );
+      const sequence = Number(rawSequence);
+      if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+        throw new Error("Redis returned an invalid request sequence");
+      }
+
+      logger.trace("SessionManager: Got next request sequence", {
+        sessionId,
+        sequence,
+      });
+      return sequence;
+    } catch (error) {
+      // 改进的 fallback：使用时间戳 + 随机数生成伪唯一序号
+      const fallbackSeq = (Date.now() % 1000000) + Math.floor(Math.random() * 1000);
+      logger.error("SessionManager: Failed to get request sequence, using fallback", {
+        error,
+        sessionId,
+        fallbackSeq,
+      });
+      return fallbackSeq;
+    }
+  }
+
+  static async isSessionRequestOwnedByKey(
+    sessionId: string,
+    requestSequence: number,
+    expectedKeyId: number
+  ): Promise<boolean> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return false;
+
+    try {
+      const ownerKey = `session:${sessionId}:req:${requestSequence}:owner`;
+      return (await redis.get(ownerKey)) === String(expectedKeyId);
+    } catch (error) {
+      logger.error("SessionManager: Failed to validate request artifact owner", {
+        error,
+        sessionId,
+        requestSequence,
+        expectedKeyId,
+      });
+      return false;
+    }
+  }
+
+  private static async refreshSessionRequestOwner(
+    redis: NonNullable<ReturnType<typeof getRedisClient>>,
+    sessionId: string,
+    requestSequence: number,
+    keyId?: number
+  ): Promise<void> {
+    if (keyId === undefined) return;
+    await redis.setex(
+      `session:${sessionId}:req:${requestSequence}:owner`,
+      SessionManager.SESSION_TTL,
+      String(keyId)
+    );
+  }
+
+  /**
+   * 获取 Session 当前的请求计数
+   *
+   * @param sessionId - Session ID
+   * @returns 当前请求数量，不存在返回 0
+   */
+  static async getSessionRequestCount(sessionId: string): Promise<number> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return 0;
+
+    try {
+      const count = await redis.get(`session:${sessionId}:seq`);
+      return count ? parseInt(count, 10) : 0;
+    } catch (error) {
+      logger.error("SessionManager: Failed to get request count", {
+        error,
+        sessionId,
+      });
+      return 0;
+    }
+  }
+
+  /**
+   * 计算 messages 内容哈希（用于 session 匹配）
+   *
+   * ⚠️ 注意: 这是一个降级方案,仅在无法从 metadata 提取 session ID 时使用
+   * 不同会话如果开头相似可能产生相同哈希,因此优先使用 metadata.user_id
+   *
+   * @param messages - 消息数组
+   * @returns 哈希值（16 字符）或 null
+   */
+  static calculateMessagesHash(messages: unknown): string | null {
+    if (!Array.isArray(messages) || messages.length === 0) {
+      logger.trace("SessionManager: calculateMessagesHash - messages is empty or not array");
+      return null;
+    }
+
+    // 计算范围：前 N 条（N = min(length, 3)）
+    const count = Math.min(messages.length, 3);
+    const contents: string[] = [];
+
+    for (let i = 0; i < count; i++) {
+      const message = messages[i];
+      if (message && typeof message === "object") {
+        const messageObj = message as Record<string, unknown>;
+        const content = messageObj.content;
+
+        if (typeof content === "string") {
+          contents.push(content);
+          logger.trace("SessionManager: Message content (string)", {
+            index: i,
+            preview: content.substring(0, 100),
+          });
+        } else if (Array.isArray(content)) {
+          // 支持多模态 content（数组格式）
+          const textParts = content
+            .filter(
+              (item) =>
+                item &&
+                typeof item === "object" &&
+                (item as Record<string, unknown>).type === "text"
+            )
+            .map((item) => (item as Record<string, unknown>).text);
+          const joined = textParts.join("");
+          contents.push(joined);
+          logger.trace("SessionManager: Message content (array)", {
+            index: i,
+            preview: joined.substring(0, 100),
+          });
+        } else {
+          logger.trace("SessionManager: Message content type (skipped)", {
+            index: i,
+            type: typeof content,
+          });
+        }
+      }
+    }
+
+    if (contents.length === 0) {
+      logger.trace("SessionManager: calculateMessagesHash - no valid contents extracted");
+      return null;
+    }
+
+    // 拼接并计算 SHA-256 哈希
+    const combined = contents.join("|");
+    const hash = crypto.createHash("sha256").update(combined, "utf8").digest("hex");
+
+    // 截取前 16 字符（足够区分，节省存储）
+    const shortHash = hash.substring(0, 16);
+    logger.trace("SessionManager: Calculated hash", {
+      hash: shortHash,
+      messageCount: contents.length,
+      totalChars: combined.length,
+    });
+
+    return shortHash;
+  }
+
+  /**
+   * 获取或创建 session_id（核心方法）
+   *
+   * @param keyId - API Key ID
+   * @param messages - 消息数组
+   * @param clientSessionId - 客户端传递的 session_id（可选）
+   * @returns session_id
+   */
+  static async getOrCreateSessionId(
+    keyId: number,
+    messages: unknown,
+    clientSessionId?: string | null
+  ): Promise<string> {
+    const redis = getRedisClient();
+
+    logger.trace("SessionManager: getOrCreateSessionId called", {
+      keyId,
+      hasClientSession: !!clientSessionId,
+      messagesLength: Array.isArray(messages) ? messages.length : 0,
+    });
+
+    // 1. 优先使用客户端传递的 session_id (来自 metadata.user_id 或 metadata.session_id)
+    if (clientSessionId) {
+      logger.debug("SessionManager: Using client-provided session", {
+        sessionId: clientSessionId,
+      });
+      // 刷新 TTL（滑动窗口）
+      if (redis && redis.status === "ready") {
+        await SessionManager.refreshSessionTTL(clientSessionId, keyId).catch((err) => {
+          logger.error("SessionManager: Failed to refresh TTL", { error: err });
+        });
+      }
+      return clientSessionId;
+    }
+
+    // 2. 降级方案：计算 messages 内容哈希（TC-047 警告：不可靠）
+    logger.warn(
+      "SessionManager: No client session ID, falling back to content hash (unreliable for compressed dialogs)",
+      {
+        keyId,
+        messagesLength: Array.isArray(messages) ? messages.length : 0,
+      }
+    );
+    const contentHash = SessionManager.calculateMessagesHash(messages);
+    if (!contentHash) {
+      // 降级：无法计算哈希，生成新 session
+      const newId = SessionManager.generateSessionId();
+      logger.warn("SessionManager: Cannot calculate hash, generating new session", {
+        sessionId: newId,
+      });
+      return newId;
+    }
+
+    // 3. 尝试从 Redis 查找已有 session
+    if (redis && redis.status === "ready") {
+      try {
+        const hashKey = buildTenantContentHashSessionKey(keyId, contentHash);
+        const existingSessionId = await redis.get(hashKey);
+
+        if (existingSessionId) {
+          const ownership = await SessionManager.proveContentHashSessionOwnership(
+            redis,
+            existingSessionId,
+            keyId
+          );
+          if (ownership.owned) {
+            // 找到当前 tenant 的已有 session，刷新 TTL
+            await SessionManager.refreshSessionTTL(existingSessionId, keyId);
+            logger.trace("SessionManager: Reusing tenant-scoped session via hash", {
+              sessionId: existingSessionId,
+              hash: contentHash,
+              keyId,
+            });
+            return existingSessionId;
+          }
+
+          logger.warn("SessionManager: Ignoring content-hash mapping without matching owner", {
+            hash: contentHash,
+            keyId,
+            mappingScope: "tenant",
+            ownerPresent: ownership.ownerPresent,
+          });
+        }
+
+        // 未找到：创建新 session
+        const newSessionId = SessionManager.generateSessionId();
+
+        // 存储映射关系（异步，不阻塞）
+        void SessionManager.storeSessionMapping(contentHash, newSessionId, keyId);
+
+        logger.trace("SessionManager: Created new session with hash", {
+          sessionId: newSessionId,
+          hash: contentHash,
+        });
+        return newSessionId;
+      } catch (error) {
+        logger.error("SessionManager: Redis error", { error });
+        // 降级：Redis 错误，生成新 session
+        return SessionManager.generateSessionId();
+      }
+    }
+
+    // 4. Redis 不可用，降级生成新 session
+    return SessionManager.generateSessionId();
+  }
+
+  /**
+   * 存储 hash → session 映射关系
+   */
+  private static async storeSessionMapping(
+    contentHash: string,
+    sessionId: string,
+    keyId: number
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const binding = await readOrReconcileSessionBinding({
+        sessionId,
+        keyId,
+        ttlSeconds: SessionManager.SESSION_TTL,
+        redis,
+      });
+      if (binding.status !== "ok") {
+        if (!binding.legacyFallbackAllowed) return;
+        const legacy = await mutateLegacySessionBindingSafely({
+          sessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+          mutation: { type: "inspect" },
+        });
+        if (legacy.status !== "ok") return;
+      }
+
+      const pipeline = redis.pipeline();
+      // Do not dual-write the historical unscoped key. Mixed-version workers
+      // may temporarily create separate Sessions; old mappings expire naturally
+      // without allowing the new path to import tenant-ambiguous state.
+      const hashKey = buildTenantContentHashSessionKey(keyId, contentHash);
+
+      // 存储映射关系
+      pipeline.setex(hashKey, SessionManager.SESSION_TTL, sessionId);
+
+      // Initialize non-binding session metadata after tenant ownership is proven.
+      pipeline.setex(
+        `session:${sessionId}:last_seen`,
+        SessionManager.SESSION_TTL,
+        Date.now().toString()
+      );
+
+      await pipeline.exec();
+    } catch (error) {
+      logger.error("SessionManager: Failed to store session mapping", {
+        error,
+      });
+    }
+  }
+
+  /**
+   * 刷新 session TTL（滑动窗口）
+   */
+  private static async refreshSessionTTL(sessionId: string, keyId?: number | null): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const pipeline = redis.pipeline();
+      // Provider selection performs the authoritative binding reconcile. Keep
+      // this path limited to session activity metadata so a request does not
+      // pay for a second full binding Lua round trip before selection.
+      if (keyId != null && readVersionedBindingCapabilityState() === "unavailable") {
+        const legacyRefresh = await mutateLegacySessionBindingSafely({
+          sessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+          mutation: { type: "refresh" },
+        });
+        if (legacyRefresh.status !== "ok") {
+          logger.warn("SessionManager: Legacy binding TTL refresh blocked", {
+            sessionId,
+            keyId,
+            reason: legacyRefresh.reason,
+          });
+        }
+      }
+      pipeline.setex(
+        `session:${sessionId}:last_seen`,
+        SessionManager.SESSION_TTL,
+        Date.now().toString()
+      );
+
+      await pipeline.exec();
+    } catch (error) {
+      logger.error("SessionManager: Failed to refresh TTL", { error });
+    }
+  }
+
+  static getVersionedBindingCapabilityState(): VersionedBindingCapabilityState {
+    return readVersionedBindingCapabilityState();
+  }
+
+  static async ensureVersionedBindingCapability(): Promise<VersionedBindingCapabilityState> {
+    return ensureVersionedBindingCapability();
+  }
+
+  static async acquireSessionDiscoveryLease(
+    sessionId: string,
+    keyId: number,
+    ttlSeconds: number,
+    ownerToken?: string
+  ): Promise<SessionDiscoveryLeaseAcquireResult> {
+    const redis = getRedisClient({ allowWhenRateLimitDisabled: true });
+    if (redis?.status !== "ready") return redisUnavailableBindingResult();
+    return acquireVersionedSessionDiscoveryLease({
+      sessionId,
+      keyId,
+      ttlSeconds,
+      ownerToken,
+      redis,
+    });
+  }
+
+  static async renewSessionDiscoveryLease(
+    sessionId: string,
+    keyId: number,
+    ownerToken: string,
+    ttlSeconds: number
+  ): Promise<SessionDiscoveryLeaseMutationResult> {
+    const redis = getRedisClient({ allowWhenRateLimitDisabled: true });
+    if (redis?.status !== "ready") return redisUnavailableBindingResult();
+    return renewVersionedSessionDiscoveryLease({
+      sessionId,
+      keyId,
+      ownerToken,
+      ttlSeconds,
+      redis,
+    });
+  }
+
+  static async releaseSessionDiscoveryLease(
+    sessionId: string,
+    keyId: number,
+    ownerToken: string
+  ): Promise<SessionDiscoveryLeaseMutationResult> {
+    const redis = getRedisClient({ allowWhenRateLimitDisabled: true });
+    if (redis?.status !== "ready") return redisUnavailableBindingResult();
+    return releaseVersionedSessionDiscoveryLease({ sessionId, keyId, ownerToken, redis });
+  }
+
+  static async getSessionBindingSnapshot(
+    sessionId: string,
+    keyId: number
+  ): Promise<SessionBindingResult> {
+    const redis = getRedisClient({ allowWhenRateLimitDisabled: true });
+    if (redis?.status !== "ready") return redisUnavailableBindingResult();
+    return readOrReconcileSessionBinding({
+      sessionId,
+      keyId,
+      ttlSeconds: SessionManager.SESSION_TTL,
+      redis,
+    });
+  }
+
+  /**
+   * Heartbeats run at one third of the configured binding TTL, leaving time
+   * for a transient Redis failure without allowing a live binding to expire.
+   */
+  static getVersionedSessionBindingRefreshIntervalMs(): number {
+    return Math.max(1, Math.floor((SessionManager.SESSION_TTL * 1000) / 3));
+  }
+
+  static async touchVersionedSessionBinding(
+    snapshot: SessionBindingSnapshot
+  ): Promise<SessionBindingResult> {
+    const redis = getRedisClient({ allowWhenRateLimitDisabled: true });
+    if (redis?.status !== "ready") return redisUnavailableBindingResult();
+    return touchSessionBinding({
+      sessionId: snapshot.sessionId,
+      keyId: snapshot.keyId,
+      expectedGeneration: snapshot.generation,
+      expectedProviderId: snapshot.providerId,
+      ttlSeconds: SessionManager.SESSION_TTL,
+      redis,
+    });
+  }
+
+  static async compareAndSetSessionProvider(
+    snapshot: SessionBindingSnapshot,
+    providerId: number
+  ): Promise<SessionBindingResult> {
+    const redis = getRedisClient({ allowWhenRateLimitDisabled: true });
+    if (redis?.status !== "ready") return redisUnavailableBindingResult();
+    return compareAndSetSessionBinding({
+      sessionId: snapshot.sessionId,
+      keyId: snapshot.keyId,
+      expectedGeneration: snapshot.generation,
+      providerId,
+      ttlSeconds: SessionManager.SESSION_TTL,
+      redis,
+    });
+  }
+
+  static async clearVersionedSessionProvider(
+    snapshot: SessionBindingSnapshot,
+    expectedProviderId: number | null,
+    cooldownTtlSeconds: number = 0
+  ): Promise<SessionBindingResult> {
+    const redis = getRedisClient({ allowWhenRateLimitDisabled: true });
+    if (redis?.status !== "ready") return redisUnavailableBindingResult();
+    return clearVersionedSessionBinding({
+      sessionId: snapshot.sessionId,
+      keyId: snapshot.keyId,
+      expectedGeneration: snapshot.generation,
+      expectedProviderId,
+      cooldownTtlSeconds,
+      ttlSeconds: SessionManager.SESSION_TTL,
+      redis,
+    });
+  }
+
+  static async isSessionProviderCoolingDown(
+    sessionId: string,
+    keyId: number,
+    providerId: number
+  ): Promise<SessionProviderCooldownResult> {
+    const redis = getRedisClient({ allowWhenRateLimitDisabled: true });
+    if (redis?.status !== "ready") return redisUnavailableBindingResult();
+    return readSessionProviderCooldown({
+      sessionId,
+      keyId,
+      providerId,
+      redis,
+    });
+  }
+
+  /**
+   * 绑定 session 到 provider（TC-009 修复：使用 SET NX 避免竞态条件）
+   */
+  static async bindSessionToProvider(
+    sessionId: string,
+    providerId: number,
+    keyId?: number | null
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      if (keyId != null) {
+        const binding = await readOrReconcileSessionBinding({
+          sessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+        });
+        if (binding.status === "ok") {
+          if (binding.snapshot.providerId !== null) {
+            logger.debug("SessionManager: Session already bound, skipping", {
+              sessionId,
+              attemptedProviderId: providerId,
+            });
+            return;
+          }
+
+          const updated = await compareAndSetSessionBinding({
+            sessionId,
+            keyId,
+            expectedGeneration: binding.snapshot.generation,
+            providerId,
+            ttlSeconds: SessionManager.SESSION_TTL,
+            redis,
+          });
+          if (updated.status === "ok") {
+            logger.trace("SessionManager: Bound versioned session to provider", {
+              sessionId,
+              providerId,
+            });
+          }
+          return;
+        }
+        if (!binding.legacyFallbackAllowed) {
+          logger.warn("SessionManager: Versioned session binding is not writable", {
+            sessionId,
+            keyId,
+            reason: binding.reason,
+          });
+          return;
+        }
+        const legacy = await mutateLegacySessionBindingSafely({
+          sessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+          mutation: { type: "bind_if_absent", providerId },
+        });
+        if (legacy.status === "ok" && legacy.changed) {
+          logger.trace("SessionManager: Bound legacy session to provider", {
+            sessionId,
+            providerId,
+          });
+        } else if (legacy.status !== "ok") {
+          logger.warn("SessionManager: Legacy session binding blocked", {
+            sessionId,
+            keyId,
+            reason: legacy.reason,
+          });
+        }
+        return;
+      }
+
+      logger.warn("SessionManager: Cannot bind session without an API key owner", {
+        sessionId,
+        providerId,
+      });
+    } catch (error) {
+      logger.error("SessionManager: Failed to bind provider", { error });
+    }
+  }
+
+  /**
+   * 获取 session 绑定的 provider
+   */
+  static async getSessionProvider(
+    sessionId: string,
+    keyId?: number | null
+  ): Promise<number | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      if (keyId != null) {
+        const binding = await readOrReconcileSessionBinding({
+          sessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+        });
+        if (binding.status === "ok") {
+          return binding.snapshot.providerId;
+        }
+        if (!binding.legacyFallbackAllowed) {
+          logger.warn("SessionManager: Versioned session binding is unavailable for reuse", {
+            sessionId,
+            keyId,
+            reason: binding.reason,
+          });
+          return null;
+        }
+
+        // A capability failure may permit a legacy read only when this
+        // session has no canonical binding. If canonical state exists, the
+        // legacy mirror is not safely writable and must not be reused.
+        const bindingKeys = buildSessionBindingKeys(sessionId, keyId);
+        if ((await redis.exists(bindingKeys.canonical)) > 0) {
+          logger.warn("SessionManager: Refusing legacy provider reuse with canonical binding", {
+            sessionId,
+            keyId,
+          });
+          return null;
+        }
+
+        const boundKeyId = await redis.get(`session:${sessionId}:key`);
+        // Fail-closed：boundKeyId 缺失（TTL 漂移、旧绑定或写入路径未原子写 key）也视为校验失败，
+        // 避免无法证明归属当前 key 的旧 provider binding 继续被复用。
+        if (boundKeyId !== keyId.toString()) {
+          logger.warn("SessionManager: Session provider binding key mismatch", {
+            sessionId,
+            expectedKeyId: keyId,
+            boundKeyId: boundKeyId ?? null,
+          });
+          return null;
+        }
+      }
+
+      const value = await redis.get(`session:${sessionId}:provider`);
+      if (value) {
+        const providerId = parseInt(value, 10);
+        if (!Number.isNaN(providerId)) {
+          return providerId;
+        }
+      }
+    } catch (error) {
+      logger.error("SessionManager: Failed to get session provider", { error });
+    }
+
+    return null;
+  }
+
+  /**
+   * 清除 session 绑定的 provider（用于跨模型 session 绑定过时时）
+   */
+  static async clearSessionProvider(
+    sessionId: string,
+    expectedProviderId?: number | null,
+    keyId?: number | null
+  ): Promise<boolean> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return false;
+
+    try {
+      if (keyId != null) {
+        const binding = await readOrReconcileSessionBinding({
+          sessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+        });
+        if (binding.status === "ok") {
+          const currentProviderId = binding.snapshot.providerId;
+          if (
+            currentProviderId === null ||
+            (expectedProviderId != null && currentProviderId !== expectedProviderId)
+          ) {
+            return false;
+          }
+
+          const cleared = await clearVersionedSessionBinding({
+            sessionId,
+            keyId,
+            expectedGeneration: binding.snapshot.generation,
+            expectedProviderId: currentProviderId,
+            ttlSeconds: SessionManager.SESSION_TTL,
+            redis,
+          });
+          const didClear = cleared.status === "ok";
+          logger.trace("SessionManager: Cleared versioned session provider binding", {
+            sessionId,
+            keyId,
+            expectedProviderId: expectedProviderId ?? null,
+            deleted: didClear,
+          });
+          return didClear;
+        }
+        if (!binding.legacyFallbackAllowed) {
+          logger.warn("SessionManager: Versioned session binding clear blocked", {
+            sessionId,
+            keyId,
+            reason: binding.reason,
+          });
+          return false;
+        }
+        const legacy = await mutateLegacySessionBindingSafely({
+          sessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+          mutation: { type: "clear", expectedProviderId },
+        });
+        return legacy.status === "ok" && legacy.changed;
+      }
+
+      logger.warn("SessionManager: Cannot clear session binding without an API key owner", {
+        sessionId,
+        expectedProviderId: expectedProviderId ?? null,
+      });
+      return false;
+    } catch (error) {
+      logger.error("SessionManager: Failed to clear session provider", { error, sessionId });
+      return false;
+    }
+  }
+
+  static async clearSessionProviders(
+    sessionId: string,
+    expectedProviderIds: Iterable<number>,
+    keyId?: number | null
+  ): Promise<boolean> {
+    const providerIds = Array.from(
+      new Set(
+        Array.from(expectedProviderIds).filter(
+          (providerId) => Number.isSafeInteger(providerId) && providerId > 0
+        )
+      )
+    );
+    if (providerIds.length === 0 || keyId == null) return false;
+
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return false;
+
+    const binding = await readOrReconcileSessionBinding({
+      sessionId,
+      keyId,
+      ttlSeconds: SessionManager.SESSION_TTL,
+      redis,
+    });
+    if (binding.status === "ok") {
+      const providerId = binding.snapshot.providerId;
+      if (providerId === null || !providerIds.includes(providerId)) return false;
+      const cleared = await clearVersionedSessionBinding({
+        sessionId,
+        keyId,
+        expectedGeneration: binding.snapshot.generation,
+        expectedProviderId: providerId,
+        ttlSeconds: SessionManager.SESSION_TTL,
+        redis,
+      });
+      return cleared.status === "ok";
+    }
+    if (!binding.legacyFallbackAllowed) return false;
+
+    const legacy = await mutateLegacySessionBindingSafely({
+      sessionId,
+      keyId,
+      ttlSeconds: SessionManager.SESSION_TTL,
+      redis,
+      mutation: { type: "clear", expectedProviderIds: providerIds },
+    });
+    return legacy.status === "ok" && legacy.changed;
+  }
+
+  /**
+   * 获取当前绑定供应商的优先级
+   *
+   * ⚠️ 修复：从 session:provider 读取（真实绑定），而不是 session:info
+   * 原因：info.providerId 是并发检查通过的供应商，可能请求失败了
+   *
+   * @param sessionId - Session ID
+   * @returns 优先级数字（数字越小优先级越高），如果未绑定或无法查询则返回 null
+   */
+  static async getSessionProviderPriority(
+    sessionId: string,
+    keyId?: number | null
+  ): Promise<number | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      const providerId = await SessionManager.getSessionProvider(sessionId, keyId);
+      if (providerId === null) {
+        return null;
+      }
+
+      // 查询供应商详情获取优先级
+      const { findProviderById } = await import("@/repository/provider");
+      const provider = await findProviderById(providerId);
+
+      if (!provider) {
+        logger.warn("SessionManager: Bound provider not found", { providerId });
+        return null;
+      }
+
+      return provider.priority;
+    } catch (error) {
+      logger.error("SessionManager: Failed to get session provider priority", {
+        error,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * 智能更新 Session 绑定
+   *
+   * 策略：首次绑定用条件创建；故障转移成功或竞速赢家跳过优先级/熔断决策，
+   * 但版本化路径仍以读取到的 generation 做 CAS，避免迟到请求覆盖更新的绑定。
+   */
+  static async updateSessionBindingSmart(
+    sessionId: string,
+    newProviderId: number,
+    newProviderPriority: number,
+    isFirstAttempt: boolean = false,
+    isFailoverSuccess: boolean = false,
+    keyId?: number | null,
+    forceUpdate: boolean = false
+  ): Promise<{
+    updated: boolean;
+    reason: string;
+    details?: string;
+    bindingSnapshot?: SessionBindingSnapshot;
+    legacyBindingUpdated?: boolean;
+  }> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") {
+      return { updated: false, reason: "redis_not_ready" };
+    }
+
+    try {
+      let versionedSnapshot: SessionBindingSnapshot | null = null;
+      let committedVersionedSnapshot: SessionBindingSnapshot | null = null;
+      let committedLegacyBinding = false;
+      let useLegacyBinding = false;
+      let legacyProviderId: number | null = null;
+
+      if (keyId != null) {
+        const binding = await readOrReconcileSessionBinding({
+          sessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+        });
+        if (binding.status === "ok") {
+          versionedSnapshot = binding.snapshot;
+        } else if (binding.legacyFallbackAllowed) {
+          const legacy = await mutateLegacySessionBindingSafely({
+            sessionId,
+            keyId,
+            ttlSeconds: SessionManager.SESSION_TTL,
+            redis,
+            mutation: { type: "inspect" },
+          });
+          if (legacy.status !== "ok") {
+            return {
+              updated: false,
+              reason: "legacy_binding_conflict",
+              details: legacy.reason,
+            };
+          }
+          useLegacyBinding = true;
+          legacyProviderId = legacy.providerId;
+        } else {
+          return {
+            updated: false,
+            reason: "versioned_binding_conflict",
+            details: binding.reason,
+          };
+        }
+      } else {
+        return {
+          updated: false,
+          reason: "binding_owner_unavailable",
+          details: "Cannot mutate a Session binding without an API key owner",
+        };
+      }
+
+      const persistBinding = async (onlyIfUnbound: boolean): Promise<boolean> => {
+        if (versionedSnapshot) {
+          if (onlyIfUnbound && versionedSnapshot.providerId !== null) {
+            return false;
+          }
+          const result = await compareAndSetSessionBinding({
+            sessionId,
+            keyId: versionedSnapshot.keyId,
+            expectedGeneration: versionedSnapshot.generation,
+            providerId: newProviderId,
+            ttlSeconds: SessionManager.SESSION_TTL,
+            redis,
+          });
+          if (result.status !== "ok") {
+            logger.warn("SessionManager: Versioned session binding CAS did not update", {
+              sessionId,
+              keyId: versionedSnapshot.keyId,
+              providerId: newProviderId,
+              reason: result.reason,
+            });
+            return false;
+          }
+          committedVersionedSnapshot = result.snapshot;
+          return true;
+        }
+
+        if (!useLegacyBinding) return false;
+        const result = await mutateLegacySessionBindingSafely({
+          sessionId,
+          keyId: keyId!,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+          mutation: onlyIfUnbound
+            ? { type: "bind_if_absent", providerId: newProviderId }
+            : { type: "set", providerId: newProviderId },
+        });
+        const updated = result.status === "ok" && result.changed;
+        if (updated) committedLegacyBinding = true;
+        return updated;
+      };
+
+      if (isFirstAttempt) {
+        if (await persistBinding(true)) {
+          logger.info("SessionManager: Bound session to provider (first success)", {
+            sessionId,
+            providerId: newProviderId,
+            priority: newProviderPriority,
+          });
+          return {
+            updated: true,
+            reason: "first_success",
+            details: `首次成功，绑定到供应商 ${newProviderId} (priority=${newProviderPriority})`,
+          };
+        }
+        return {
+          updated: false,
+          reason: "concurrent_binding_exists",
+          details: "并发请求已绑定，跳过",
+        };
+      }
+
+      if (isFailoverSuccess || forceUpdate) {
+        const updated = await persistBinding(false);
+        if (!updated) {
+          return {
+            updated: false,
+            reason: "concurrent_binding_changed",
+            details: "Session binding changed before the update committed",
+          };
+        }
+
+        const reason = isFailoverSuccess ? "failover_success" : "race_winner_forced";
+        logger.info(
+          isFailoverSuccess
+            ? "SessionManager: Updated binding after failover"
+            : "SessionManager: Forced binding to race winner",
+          {
+            sessionId,
+            newProviderId,
+            newPriority: newProviderPriority,
+          }
+        );
+
+        return {
+          updated: true,
+          reason,
+          details: isFailoverSuccess
+            ? `故障转移成功，绑定到供应商 ${newProviderId}`
+            : `竞速赢家强制改绑到供应商 ${newProviderId}`,
+          ...(committedVersionedSnapshot ? { bindingSnapshot: committedVersionedSnapshot } : {}),
+          ...(committedLegacyBinding ? { legacyBindingUpdated: true } : {}),
+        };
+      }
+
+      const currentProviderId: number | null = versionedSnapshot?.providerId ?? legacyProviderId;
+
+      if (currentProviderId === null) {
+        if (await persistBinding(true)) {
+          logger.info("SessionManager: Bound session (no previous binding)", {
+            sessionId,
+            providerId: newProviderId,
+            priority: newProviderPriority,
+          });
+          return {
+            updated: true,
+            reason: "no_previous_binding",
+            details: `无绑定，绑定到供应商 ${newProviderId} (priority=${newProviderPriority})`,
+          };
+        }
+        return {
+          updated: false,
+          reason: "concurrent_binding_exists",
+          details: "并发请求已绑定",
+        };
+      }
+
+      const { findProviderById } = await import("@/repository/provider");
+      const currentProvider = await findProviderById(currentProviderId);
+
+      if (!currentProvider) {
+        if (!(await persistBinding(false))) {
+          return { updated: false, reason: "concurrent_binding_changed" };
+        }
+
+        logger.info("SessionManager: Updated binding (current provider not found)", {
+          sessionId,
+          oldProviderId: currentProviderId,
+          newProviderId,
+          newPriority: newProviderPriority,
+        });
+
+        return {
+          updated: true,
+          reason: "current_provider_not_found",
+          details: `原供应商 ${currentProviderId} 不存在，更新到 ${newProviderId}`,
+        };
+      }
+
+      const currentPriority = currentProvider.priority || 0;
+
+      if (newProviderPriority < currentPriority) {
+        if (!(await persistBinding(false))) {
+          return { updated: false, reason: "concurrent_binding_changed" };
+        }
+
+        logger.info("SessionManager: Migrated to higher priority provider", {
+          sessionId,
+          oldProviderId: currentProviderId,
+          oldProviderName: currentProvider.name,
+          oldPriority: currentPriority,
+          newProviderId,
+          newPriority: newProviderPriority,
+        });
+
+        return {
+          updated: true,
+          reason: "priority_upgrade",
+          details: `优先级升级：从供应商 ${currentProvider.name} (priority=${currentPriority}) 迁移到 ${newProviderId} (priority=${newProviderPriority})`,
+        };
+      }
+
+      const { isCircuitOpen } = await import("@/lib/circuit-breaker");
+      const isCurrentCircuitOpen = await isCircuitOpen(currentProviderId);
+
+      if (isCurrentCircuitOpen) {
+        if (!(await persistBinding(false))) {
+          return { updated: false, reason: "concurrent_binding_changed" };
+        }
+
+        logger.info("SessionManager: Migrated to backup provider (circuit open)", {
+          sessionId,
+          oldProviderId: currentProviderId,
+          oldProviderName: currentProvider.name,
+          oldPriority: currentPriority,
+          newProviderId,
+          newPriority: newProviderPriority,
+        });
+
+        return {
+          updated: true,
+          reason: "circuit_open_fallback",
+          details: `原供应商 ${currentProvider.name} (priority=${currentPriority}) 已熔断，切换到供应商 ${newProviderId} (priority=${newProviderPriority})`,
+        };
+      }
+
+      logger.debug("SessionManager: Keeping current provider (healthy and higher/equal priority)", {
+        sessionId,
+        currentProviderId,
+        currentProviderName: currentProvider.name,
+        currentPriority,
+        attemptedProviderId: newProviderId,
+        attemptedPriority: newProviderPriority,
+      });
+
+      return {
+        updated: false,
+        reason: "keep_healthy_higher_priority",
+        details: `保持原供应商 ${currentProvider.name} (priority=${currentPriority}, 健康)，拒绝供应商 ${newProviderId} (priority=${newProviderPriority})`,
+      };
+    } catch (error) {
+      logger.error("SessionManager: Failed to update session binding", {
+        error,
+      });
+      return { updated: false, reason: "error", details: String(error) };
+    }
+  }
+
+  /**
+   * 存储 session 基础信息（请求开始时调用）
+   */
+  static async storeSessionInfo(sessionId: string, info: SessionStoreInfo): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const pipeline = redis.pipeline();
+
+      // 存储详细信息到 Hash
+      pipeline.hset(`session:${sessionId}:info`, {
+        userName: info.userName,
+        userId: info.userId.toString(),
+        keyId: info.keyId.toString(),
+        keyName: info.keyName,
+        model: info.model || "",
+        apiType: info.apiType,
+        startTime: Date.now().toString(),
+        status: "in_progress", // 初始状态
+      });
+
+      // 设置 TTL
+      pipeline.expire(`session:${sessionId}:info`, SessionManager.SESSION_TTL);
+
+      await pipeline.exec();
+      logger.trace("SessionManager: Stored session info", { sessionId });
+    } catch (error) {
+      logger.error("SessionManager: Failed to store session info", { error });
+    }
+  }
+
+  /**
+   * 更新 session 供应商信息（选择供应商后调用）
+   */
+  static async updateSessionProvider(
+    sessionId: string,
+    providerInfo: SessionProviderInfo
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const pipeline = redis.pipeline();
+
+      // 更新 info Hash 中的 provider 字段
+      pipeline.hset(`session:${sessionId}:info`, {
+        providerId: providerInfo.providerId.toString(),
+        providerName: providerInfo.providerName,
+      });
+
+      // 刷新 TTL
+      pipeline.expire(`session:${sessionId}:info`, SessionManager.SESSION_TTL);
+
+      await pipeline.exec();
+      logger.trace("SessionManager: Updated session provider", {
+        sessionId,
+        providerName: providerInfo.providerName,
+      });
+    } catch (error) {
+      logger.error("SessionManager: Failed to update session provider", {
+        error,
+      });
+    }
+  }
+
+  /**
+   * 更新 session 使用量和状态（响应完成时调用）
+   */
+  static async updateSessionUsage(sessionId: string, usage: SessionUsageUpdate): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const pipeline = redis.pipeline();
+
+      // 存储使用量到单独的 Hash
+      const usageData: Record<string, string> = {
+        status: usage.status,
+      };
+
+      if (usage.inputTokens !== undefined) {
+        usageData.inputTokens = usage.inputTokens.toString();
+      }
+      if (usage.outputTokens !== undefined) {
+        usageData.outputTokens = usage.outputTokens.toString();
+      }
+      if (usage.cacheCreationInputTokens !== undefined) {
+        usageData.cacheCreationInputTokens = usage.cacheCreationInputTokens.toString();
+      }
+      if (usage.cacheReadInputTokens !== undefined) {
+        usageData.cacheReadInputTokens = usage.cacheReadInputTokens.toString();
+      }
+      if (usage.costUsd !== undefined) {
+        usageData.costUsd = usage.costUsd;
+      }
+      if (usage.statusCode !== undefined) {
+        usageData.statusCode = usage.statusCode.toString();
+      }
+      if (usage.errorMessage !== undefined) {
+        usageData.errorMessage = usage.errorMessage;
+      }
+
+      pipeline.hset(`session:${sessionId}:usage`, usageData);
+
+      // 同时更新 info Hash 中的 status
+      pipeline.hset(`session:${sessionId}:info`, "status", usage.status);
+
+      // 刷新 TTL
+      pipeline.expire(`session:${sessionId}:usage`, SessionManager.SESSION_TTL);
+      pipeline.expire(`session:${sessionId}:info`, SessionManager.SESSION_TTL);
+
+      await pipeline.exec();
+      logger.trace("SessionManager: Updated session usage", {
+        sessionId,
+        status: usage.status,
+      });
+    } catch (error) {
+      logger.error("SessionManager: Failed to update session usage", { error });
+    }
+  }
+
+  /**
+   * 存储 session 请求 messages
+   *
+   * 存储策略受 STORE_SESSION_MESSAGES 控制：
+   * - true：原样存储 message 内容
+   * - false（默认）：存储但对 message 内容脱敏 [REDACTED]
+   *
+   * @param sessionId - Session ID
+   * @param messages - 消息内容
+   * @param requestSequence - 可选，请求序号。提供时使用新的 key 格式存储独立消息
+   */
+  static async storeSessionMessages(
+    sessionId: string,
+    messages: unknown,
+    requestSequence?: number
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      // 根据配置决定是否脱敏
+      const messagesToStore = SessionManager.STORE_MESSAGES ? messages : redactMessages(messages);
+      const messagesJson = JSON.stringify(messagesToStore);
+      // 新格式：session:{sessionId}:req:{sequence}:messages（独立存储每个请求）
+      // 旧格式：session:{sessionId}:messages（向后兼容）
+      const key = requestSequence
+        ? `session:${sessionId}:req:${requestSequence}:messages`
+        : `session:${sessionId}:messages`;
+      if (!canStoreSessionRequestArtifact(messagesJson, "messages")) {
+        await redis.del(key);
+        return;
+      }
+      await redis.setex(key, SessionManager.SESSION_TTL, messagesJson);
+      logger.trace("SessionManager: Stored session messages", {
+        sessionId,
+        requestSequence,
+        key,
+        redacted: !SessionManager.STORE_MESSAGES,
+      });
+    } catch (error) {
+      logger.error("SessionManager: Failed to store session messages", {
+        error,
+      });
+    }
+  }
+
+  /**
+   * 辅助方法：从 Redis Hash 数据构建 ActiveSessionInfo 对象
+   *
+   * @private
+   */
+  private static buildSessionInfo(
+    sessionId: string,
+    info: Record<string, string>,
+    usage: Record<string, string>
+  ): ActiveSessionInfo {
+    const startTime = parseInt(info.startTime || "0", 10);
+    const now = Date.now();
+
+    const session: ActiveSessionInfo = {
+      sessionId,
+      userName: info.userName || "unknown",
+      userId: parseInt(info.userId || "0", 10),
+      keyId: parseInt(info.keyId || "0", 10),
+      keyName: info.keyName || "unknown",
+      providerId: info.providerId ? parseInt(info.providerId, 10) : null,
+      providerName: info.providerName || null,
+      model: info.model || null,
+      apiType: (info.apiType as "chat" | "codex") || "chat",
+      startTime,
+      status: (usage.status || info.status || "in_progress") as
+        | "in_progress"
+        | "completed"
+        | "error",
+      durationMs: startTime > 0 ? now - startTime : undefined,
+    };
+
+    // 添加 usage 数据（如果存在）
+    if (usage && Object.keys(usage).length > 0) {
+      if (usage.inputTokens) session.inputTokens = parseInt(usage.inputTokens, 10);
+      if (usage.outputTokens) session.outputTokens = parseInt(usage.outputTokens, 10);
+      if (usage.cacheCreationInputTokens)
+        session.cacheCreationInputTokens = parseInt(usage.cacheCreationInputTokens, 10);
+      if (usage.cacheReadInputTokens)
+        session.cacheReadInputTokens = parseInt(usage.cacheReadInputTokens, 10);
+      if (usage.costUsd) session.costUsd = usage.costUsd;
+      if (usage.statusCode) session.statusCode = parseInt(usage.statusCode, 10);
+      if (usage.errorMessage) session.errorMessage = usage.errorMessage;
+
+      // 计算总 token
+      const input = session.inputTokens || 0;
+      const output = session.outputTokens || 0;
+      const cacheCreate = session.cacheCreationInputTokens || 0;
+      const cacheRead = session.cacheReadInputTokens || 0;
+      session.totalTokens = input + output + cacheCreate + cacheRead;
+    }
+
+    return session;
+  }
+
+  /**
+   * 获取活跃 session 列表（用于实时监控页面）
+   */
+  static async getActiveSessions(): Promise<ActiveSessionInfo[]> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") {
+      logger.warn("SessionManager: Redis not ready, returning empty list");
+      return [];
+    }
+
+    try {
+      // 1. 使用 SessionTracker 获取活跃 session ID（自动兼容 ZSET/Set）
+      const sessionIds = await SessionTracker.getActiveSessions();
+      if (sessionIds.length === 0) {
+        return [];
+      }
+
+      logger.trace("SessionManager: Found active sessions", {
+        count: sessionIds.length,
+      });
+
+      // 2. 批量获取 session 详细信息
+      const sessions: ActiveSessionInfo[] = [];
+      const pipeline = redis.pipeline();
+
+      for (const sessionId of sessionIds) {
+        pipeline.hgetall(`session:${sessionId}:info`);
+        pipeline.hgetall(`session:${sessionId}:usage`);
+      }
+
+      const results = await pipeline.exec();
+      if (!results) {
+        return [];
+      }
+
+      // 3. 解析结果
+      for (let i = 0; i < sessionIds.length; i++) {
+        const infoIndex = i * 2;
+        const usageIndex = i * 2 + 1;
+
+        const infoResult = results[infoIndex];
+        const usageResult = results[usageIndex];
+
+        // 检查结果有效性
+        if (!infoResult || infoResult[0] !== null) continue;
+        if (!usageResult || usageResult[0] !== null) continue;
+
+        const info = infoResult[1] as Record<string, string>;
+        const usage = usageResult[1] as Record<string, string>;
+
+        // 跳过空的 info（session 可能已过期）
+        if (!info || Object.keys(info).length === 0) continue;
+
+        // 使用辅助方法构建 session 对象
+        const session = SessionManager.buildSessionInfo(sessionIds[i], info, usage);
+        sessions.push(session);
+      }
+
+      logger.trace("SessionManager: Retrieved active sessions with details", {
+        count: sessions.length,
+      });
+      return sessions;
+    } catch (error) {
+      logger.error("SessionManager: Failed to get active sessions", { error });
+      return [];
+    }
+  }
+
+  /**
+   * 获取所有 session（包括非活跃的）
+   *
+   * 使用 SCAN 扫描 Redis 中所有 session:*:info key，
+   * 按最后活跃时间分为活跃（5 分钟内）和非活跃两组。
+   *
+   * @returns { active: 活跃 session 列表, inactive: 非活跃 session 列表 }
+   */
+  static async getAllSessionsWithExpiry(): Promise<{
+    active: ActiveSessionInfo[];
+    inactive: ActiveSessionInfo[];
+  }> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") {
+      logger.warn("SessionManager: Redis not ready, returning empty lists");
+      return { active: [], inactive: [] };
+    }
+
+    try {
+      const now = Date.now();
+      const fiveMinutesAgo = now - SessionManager.SESSION_TTL * 1000; // SESSION_TTL 是秒，转为毫秒
+
+      // 1. 使用 SCAN 扫描所有 session:*:info key
+      const allSessions: ActiveSessionInfo[] = [];
+      let cursor = "0";
+
+      do {
+        const [nextCursor, keys] = (await redis.scan(
+          cursor,
+          "MATCH",
+          "session:*:info",
+          "COUNT",
+          100
+        )) as [string, string[]];
+
+        cursor = nextCursor;
+
+        if (keys.length > 0) {
+          // 2. 批量获取 session info 和 usage
+          const pipeline = redis.pipeline();
+
+          for (const key of keys) {
+            pipeline.hgetall(key);
+            // 提取 sessionId
+            const sessionId = key.replace("session:", "").replace(":info", "");
+            pipeline.hgetall(`session:${sessionId}:usage`);
+          }
+
+          const results = await pipeline.exec();
+          if (!results) continue;
+
+          // 3. 解析结果
+          for (let i = 0; i < keys.length; i++) {
+            const infoIndex = i * 2;
+            const usageIndex = i * 2 + 1;
+
+            const infoResult = results[infoIndex];
+            const usageResult = results[usageIndex];
+
+            // 检查结果有效性
+            if (!infoResult || infoResult[0] !== null) continue;
+            if (!usageResult || usageResult[0] !== null) continue;
+
+            const info = infoResult[1] as Record<string, string>;
+            const usage = usageResult[1] as Record<string, string>;
+
+            // 跳过空的 info
+            if (!info || Object.keys(info).length === 0) continue;
+
+            // 提取 sessionId
+            const sessionId = keys[i].replace("session:", "").replace(":info", "");
+
+            // 使用辅助方法构建 session 对象
+            const session = SessionManager.buildSessionInfo(sessionId, info, usage);
+            allSessions.push(session);
+          }
+        }
+      } while (cursor !== "0");
+
+      // 4. 按最后活跃时间分组
+      const active: ActiveSessionInfo[] = [];
+      const inactive: ActiveSessionInfo[] = [];
+
+      for (const session of allSessions) {
+        if (session.startTime >= fiveMinutesAgo) {
+          active.push(session);
+        } else {
+          inactive.push(session);
+        }
+      }
+
+      logger.trace("SessionManager: Found sessions", {
+        active: active.length,
+        inactive: inactive.length,
+        total: allSessions.length,
+      });
+
+      return { active, inactive };
+    } catch (error) {
+      logger.error("SessionManager: Failed to get all sessions", { error });
+      return { active: [], inactive: [] };
+    }
+  }
+
+  /**
+   * 获取所有 session ID 列表（轻量级版本）
+   * 仅返回 session ID，不返回详细信息
+   *
+   * @returns session ID 数组
+   */
+  static async getAllSessionIds(): Promise<string[]> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") {
+      logger.warn("SessionManager: Redis not ready, returning empty list");
+      return [];
+    }
+
+    try {
+      const sessionIds: string[] = [];
+      let cursor = "0";
+
+      do {
+        const [nextCursor, keys] = (await redis.scan(
+          cursor,
+          "MATCH",
+          "session:*:info",
+          "COUNT",
+          100
+        )) as [string, string[]];
+
+        cursor = nextCursor;
+
+        if (keys.length > 0) {
+          // 提取 sessionId
+          for (const key of keys) {
+            const sessionId = key.replace("session:", "").replace(":info", "");
+            sessionIds.push(sessionId);
+          }
+        }
+      } while (cursor !== "0");
+
+      logger.trace(`SessionManager: Found ${sessionIds.length} session IDs`);
+
+      return sessionIds;
+    } catch (error) {
+      logger.error("SessionManager: Failed to get session IDs", { error });
+      return [];
+    }
+  }
+
+  /**
+   * 获取 session 的 messages 内容
+   *
+   * @param sessionId - Session ID
+   * @param requestSequence - 可选，请求序号。提供时读取特定请求的消息
+   * @returns 消息内容（解析后的 JSON 对象，可能已脱敏）
+   */
+  static async getSessionMessages(
+    sessionId: string,
+    requestSequence?: number
+  ): Promise<unknown | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      if (requestSequence !== undefined) {
+        const sequence = normalizeRequestSequence(requestSequence);
+        if (sequence === null) return null;
+
+        const newKey = `session:${sessionId}:req:${sequence}:messages`;
+        const messagesJson = await redis.get(newKey);
+        return messagesJson ? JSON.parse(messagesJson) : null;
+      }
+
+      // 向后兼容：尝试旧格式
+      const legacyKey = `session:${sessionId}:messages`;
+      const messagesJson = await redis.get(legacyKey);
+      if (!messagesJson) {
+        return null;
+      }
+      return JSON.parse(messagesJson);
+    } catch (error) {
+      logger.error("SessionManager: Failed to get session messages", { error });
+      return null;
+    }
+  }
+
+  /**
+   * 检查 Session 是否有任意请求的 messages
+   *
+   * 使用 Redis SCAN 检查是否存在任意格式的 messages key：
+   * - 新格式：session:{sessionId}:req:*:messages
+   * - 旧格式：session:{sessionId}:messages
+   *
+   * @param sessionId - Session ID
+   * @returns 是否存在任意 messages
+   */
+  static async hasAnySessionMessages(sessionId: string): Promise<boolean> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return false;
+
+    try {
+      // 1. 先检查旧格式（直接 EXISTS 更高效）
+      const legacyKey = `session:${sessionId}:messages`;
+      const legacyExists = await redis.exists(legacyKey);
+      if (legacyExists) {
+        return true;
+      }
+
+      // 2. 检查新格式：使用 SCAN 搜索 session:{sessionId}:req:*:messages
+      let cursor = "0";
+      do {
+        const [nextCursor, keys] = (await redis.scan(
+          cursor,
+          "MATCH",
+          `session:${sessionId}:req:*:messages`,
+          "COUNT",
+          100
+        )) as [string, string[]];
+
+        cursor = nextCursor;
+
+        // 找到任意一个就返回 true
+        if (keys.length > 0) {
+          return true;
+        }
+      } while (cursor !== "0");
+
+      return false;
+    } catch (error) {
+      logger.error("SessionManager: Failed to check session messages existence", { error });
+      return false;
+    }
+  }
+
+  /**
+   * 存储 session 响应体（临时存储，5分钟过期）
+   *
+   * 存储行为受 STORE_SESSION_RESPONSE_BODY 控制：
+   * - true (默认)：在 SESSION_RESPONSE_BODY_MAX_BYTES 上限内存储响应体到 Redis 临时缓存
+   * - false：不存储（注意：不影响本次请求处理与统计，仅影响后续查看 response body）
+   *
+   * 存储策略（脱敏/原样）受 STORE_SESSION_MESSAGES 控制：
+   * - true：原样存储响应内容
+   * - false（默认）：对 JSON 响应体中的 message 内容脱敏 [REDACTED]
+   *
+   * @param sessionId - Session ID
+   * @param response - 响应体内容（字符串或对象）
+   * @param requestSequence - 可选，请求序号。提供时使用新的 key 格式存储独立响应
+   */
+  static async storeSessionResponse(
+    sessionId: string,
+    response: string | object,
+    requestSequence?: number,
+    keyId?: number
+  ): Promise<void> {
+    // 允许通过环境变量显式关闭响应体存储（例如隐私/节省 Redis 内存）。
+    // 注意：这里仅关闭“写入 Redis”这一步；调用方仍然可能在内存中读取响应体用于统计或错误检测。
+    if (!getEnvConfig().STORE_SESSION_RESPONSE_BODY) return;
+
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      // 新格式：session:{sessionId}:req:{sequence}:response（独立存储每个请求）
+      // 旧格式：session:{sessionId}:response（向后兼容）
+      const sequence = normalizeRequestSequence(requestSequence);
+      const key = sequence
+        ? `session:${sessionId}:req:${sequence}:response`
+        : `session:${sessionId}:response`;
+      if (typeof response === "string" && !canStoreSessionResponseBody(response, "response")) {
+        await redis.del(key);
+        return;
+      }
+
+      let responseString: string;
+
+      if (SessionManager.STORE_MESSAGES) {
+        // 原样存储
+        responseString = typeof response === "string" ? response : JSON.stringify(response);
+      } else {
+        // 尝试解析 JSON 并脱敏
+        if (typeof response === "object") {
+          responseString = JSON.stringify(redactResponseBody(response));
+        } else {
+          // 字符串响应 - 尝试解析为 JSON
+          try {
+            const parsed = JSON.parse(response);
+            responseString = JSON.stringify(redactResponseBody(parsed));
+          } catch {
+            // 非 JSON（如 SSE 流），原样存储
+            responseString = response;
+          }
+        }
+      }
+
+      if (!canStoreSessionResponseBody(responseString, "response")) {
+        await redis.del(key);
+        return;
+      }
+
+      if (sequence) {
+        await SessionManager.refreshSessionRequestOwner(redis, sessionId, sequence, keyId);
+      }
+      await redis.setex(key, SessionManager.SESSION_TTL, responseString);
+      logger.trace("SessionManager: Stored session response", {
+        sessionId,
+        requestSequence,
+        size: responseString.length,
+        redacted: !SessionManager.STORE_MESSAGES,
+      });
+    } catch (error) {
+      logger.error("SessionManager: Failed to store session response", {
+        error,
+      });
+    }
+  }
+
+  static async storeSessionResponseBodySet(
+    sessionId: string,
+    input: SessionResponseBodySetInput,
+    requestSequence?: number,
+    keyId?: number
+  ): Promise<void> {
+    if (!getEnvConfig().STORE_SESSION_RESPONSE_BODY) return;
+
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    const sequence = normalizeRequestSequence(requestSequence);
+    if (sequence === null) {
+      if (keyId !== undefined) {
+        logger.warn("SessionManager: Skipped response body set with invalid request sequence", {
+          sessionId,
+          requestSequence,
+          keyId,
+        });
+        return;
+      }
+      const writes: Array<Promise<void>> = [];
+      if (input.legacy !== undefined && input.legacy !== null) {
+        writes.push(
+          SessionManager.storeSessionResponse(sessionId, input.legacy, requestSequence, keyId)
+        );
+      }
+      if (input.before !== undefined && input.before !== null) {
+        writes.push(
+          SessionManager.storeSessionResponsePhaseSnapshot(
+            sessionId,
+            "before",
+            { body: input.before },
+            requestSequence,
+            keyId
+          )
+        );
+      }
+      if (input.after !== undefined && input.after !== null) {
+        writes.push(
+          SessionManager.storeSessionResponsePhaseSnapshot(
+            sessionId,
+            "after",
+            { body: input.after },
+            requestSequence,
+            keyId
+          )
+        );
+      }
+      await Promise.all(writes);
+      return;
+    }
+
+    try {
+      const bundleKey = buildSessionResponseBodyBundleKey(sessionId, sequence);
+      const bundleIndexKey = buildSessionResponseBodyBundleIndexKey(sessionId);
+      const generationKey = buildSessionResponseBodyGenerationKey(sessionId);
+      const requestGenerationKey = buildSessionRequestResponseBodyGenerationKey(
+        sessionId,
+        sequence
+      );
+      const requestOwnerKey = `session:${sessionId}:req:${sequence}:owner`;
+      const legacyKeys = SESSION_RESPONSE_BODY_VIEWS.map((view) =>
+        buildLegacySessionResponseBodyViewKey(sessionId, sequence, view)
+      );
+      if (!getEnvConfig().SESSION_RESPONSE_BODY_DEDUP_ENABLED) {
+        const legacy = prepareLegacySessionResponseBodySet(input, SessionManager.STORE_MESSAGES);
+        await SessionManager.refreshSessionRequestOwner(redis, sessionId, sequence, keyId);
+        await redis.eval(
+          WRITE_LEGACY_SESSION_RESPONSE_BODY_SET_LUA,
+          8,
+          bundleKey,
+          ...legacyKeys,
+          bundleIndexKey,
+          generationKey,
+          requestGenerationKey,
+          requestOwnerKey,
+          SessionManager.SESSION_TTL,
+          keyId ?? "",
+          legacy.present.legacy ? 1 : 0,
+          legacy.bodies.legacy === null ? 0 : 1,
+          legacy.bodies.legacy ?? "",
+          legacy.present.before ? 1 : 0,
+          legacy.bodies.before === null ? 0 : 1,
+          legacy.bodies.before ?? "",
+          legacy.present.after ? 1 : 0,
+          legacy.bodies.after === null ? 0 : 1,
+          legacy.bodies.after ?? ""
+        );
+        return;
+      }
+
+      const bundle = prepareSessionResponseBodyBundle(input, SessionManager.STORE_MESSAGES);
+      const maxBytes = getSessionResponseBodyMaxBytes();
+      if (bundle.overBudget) {
+        logger.warn("SessionManager: Skipped response body bundle over aggregate limit", {
+          sessionId,
+          requestSequence: sequence,
+          byteSize: bundle.byteSize,
+          maxBytes,
+        });
+      }
+
+      await SessionManager.refreshSessionRequestOwner(redis, sessionId, sequence, keyId);
+      await redis.eval(
+        WRITE_SESSION_RESPONSE_BODY_BUNDLE_LUA,
+        8,
+        bundleKey,
+        ...legacyKeys,
+        bundleIndexKey,
+        generationKey,
+        requestGenerationKey,
+        requestOwnerKey,
+        SessionManager.SESSION_TTL,
+        keyId ?? "",
+        bundle.byteSize,
+        bundle.overBudget ? 1 : 0,
+        bundle.present.legacy ? 1 : 0,
+        bundle.present.before ? 1 : 0,
+        bundle.present.after ? 1 : 0,
+        bundle.refs.legacy,
+        bundle.refs.before,
+        bundle.refs.after,
+        ...bundle.bodies
+      );
+    } catch (error) {
+      logger.error("SessionManager: Failed to store response body bundle", {
+        error,
+        sessionId,
+        requestSequence,
+      });
+    }
+  }
+
+  /**
+   * 存储 session 完整请求体（客户端原始请求体，临时存储，5分钟过期）
+   *
+   * 存储策略受 STORE_SESSION_MESSAGES 控制：
+   * - true：原样存储请求体内容
+   * - false（默认）：存储但对 message 内容脱敏 [REDACTED]
+   *
+   * @param sessionId - Session ID
+   * @param requestBody - 请求体（完整 JSON）
+   * @param requestSequence - 可选，请求序号
+   */
+  static async storeSessionRequestBody(
+    sessionId: string,
+    requestBody: unknown,
+    requestSequence?: number
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence) ?? 1;
+      const key = `session:${sessionId}:req:${sequence}:requestBody`;
+      // 根据配置决定是否脱敏
+      const bodyToStore = SessionManager.STORE_MESSAGES
+        ? requestBody
+        : redactRequestBody(requestBody);
+      const payload = JSON.stringify(bodyToStore);
+      if (!canStoreSessionRequestArtifact(payload, "requestBody")) {
+        await redis.del(key);
+        return;
+      }
+      await redis.setex(key, SessionManager.SESSION_TTL, payload);
+      logger.trace("SessionManager: Stored session request body", {
+        sessionId,
+        requestSequence: sequence,
+        key,
+        size: payload.length,
+        redacted: !SessionManager.STORE_MESSAGES,
+      });
+    } catch (error) {
+      logger.error("SessionManager: Failed to store session request body", { error, sessionId });
+    }
+  }
+
+  /**
+   * 获取 session 完整请求体（客户端原始请求体，可能已脱敏）
+   *
+   * @param sessionId - Session ID
+   * @param requestSequence - 请求序号
+   * @returns 解析后的 JSON 对象（可能已脱敏）
+   */
+  static async getSessionRequestBody(
+    sessionId: string,
+    requestSequence?: number
+  ): Promise<unknown | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence);
+      if (!sequence) return null;
+      const key = `session:${sessionId}:req:${sequence}:requestBody`;
+      const value = await redis.get(key);
+      if (!value) return null;
+      return JSON.parse(value) as unknown;
+    } catch (error) {
+      logger.error("SessionManager: Failed to get session request body", { error, sessionId });
+      return null;
+    }
+  }
+
+  /**
+   * 存储特殊设置（审计字段，临时存储，5分钟过期）
+   *
+   * @param sessionId - Session ID
+   * @param specialSettings - 特殊设置（可为空）
+   * @param requestSequence - 请求序号
+   */
+  static async storeSessionSpecialSettings(
+    sessionId: string,
+    specialSettings: SpecialSetting[] | null,
+    requestSequence?: number
+  ): Promise<void> {
+    if (!specialSettings || specialSettings.length === 0) {
+      return;
+    }
+
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence) ?? 1;
+      const key = `session:${sessionId}:req:${sequence}:specialSettings`;
+      const payload = JSON.stringify(specialSettings);
+      await redis.setex(key, SessionManager.SESSION_TTL, payload);
+    } catch (error) {
+      logger.error("SessionManager: Failed to store special settings", { error, sessionId });
+    }
+  }
+
+  static async getSessionSpecialSettings(
+    sessionId: string,
+    requestSequence?: number
+  ): Promise<SpecialSetting[] | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence);
+      if (!sequence) return null;
+      const key = `session:${sessionId}:req:${sequence}:specialSettings`;
+      const value = await redis.get(key);
+      if (!value) return null;
+
+      const parsed: unknown = JSON.parse(value);
+      if (!Array.isArray(parsed)) return null;
+      return parsed as SpecialSetting[];
+    } catch (error) {
+      logger.error("SessionManager: Failed to get special settings", { error, sessionId });
+      return null;
+    }
+  }
+
+  /**
+   * 存储客户端请求元信息（端点/方法，临时存储，5分钟过期）
+   *
+   * @param sessionId - Session ID
+   * @param meta - 元信息
+   * @param requestSequence - 请求序号
+   */
+  static async storeSessionClientRequestMeta(
+    sessionId: string,
+    meta: { url: string | URL; method: string },
+    requestSequence?: number
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence) ?? 1;
+      const key = `session:${sessionId}:req:${sequence}:clientReqMeta`;
+      const payload: SessionRequestMeta = {
+        url: sanitizeUrl(meta.url),
+        method: meta.method,
+      };
+      await redis.setex(key, SessionManager.SESSION_TTL, JSON.stringify(payload));
+    } catch (error) {
+      logger.error("SessionManager: Failed to store client request meta", { error, sessionId });
+    }
+  }
+
+  static async getSessionClientRequestMeta(
+    sessionId: string,
+    requestSequence?: number
+  ): Promise<SessionRequestMeta | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence);
+      if (!sequence) return null;
+      const key = `session:${sessionId}:req:${sequence}:clientReqMeta`;
+      const value = await redis.get(key);
+      if (!value) return null;
+
+      const parsed: unknown = JSON.parse(value);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      const obj = parsed as Record<string, unknown>;
+      if (typeof obj.url !== "string" || typeof obj.method !== "string") return null;
+      return { url: obj.url, method: obj.method };
+    } catch (error) {
+      logger.error("SessionManager: Failed to get client request meta", { error, sessionId });
+      return null;
+    }
+  }
+
+  /**
+   * 存储上游请求元信息（端点/方法，临时存储，5分钟过期）
+   *
+   * @param sessionId - Session ID
+   * @param meta - 元信息
+   * @param requestSequence - 请求序号
+   */
+  static async storeSessionUpstreamRequestMeta(
+    sessionId: string,
+    meta: { url: string | URL; method: string },
+    requestSequence?: number
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence) ?? 1;
+      const key = `session:${sessionId}:req:${sequence}:upstreamReqMeta`;
+      const payload: SessionRequestMeta = {
+        url: sanitizeUrl(meta.url),
+        method: meta.method,
+      };
+      await redis.setex(key, SessionManager.SESSION_TTL, JSON.stringify(payload));
+    } catch (error) {
+      logger.error("SessionManager: Failed to store upstream request meta", { error, sessionId });
+    }
+  }
+
+  static async getSessionUpstreamRequestMeta(
+    sessionId: string,
+    requestSequence?: number
+  ): Promise<SessionRequestMeta | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence);
+      if (!sequence) return null;
+      const key = `session:${sessionId}:req:${sequence}:upstreamReqMeta`;
+      const value = await redis.get(key);
+      if (!value) return null;
+
+      const parsed: unknown = JSON.parse(value);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      const obj = parsed as Record<string, unknown>;
+      if (typeof obj.url !== "string" || typeof obj.method !== "string") return null;
+      return { url: obj.url, method: obj.method };
+    } catch (error) {
+      logger.error("SessionManager: Failed to get upstream request meta", { error, sessionId });
+      return null;
+    }
+  }
+
+  /**
+   * 存储上游响应元信息（端点/状态码，临时存储，5分钟过期）
+   *
+   * @param sessionId - Session ID
+   * @param meta - 元信息
+   * @param requestSequence - 请求序号
+   */
+  static async storeSessionUpstreamResponseMeta(
+    sessionId: string,
+    meta: { url: string | URL; statusCode: number },
+    requestSequence?: number,
+    keyId?: number
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence) ?? 1;
+      await SessionManager.refreshSessionRequestOwner(redis, sessionId, sequence, keyId);
+      const key = `session:${sessionId}:req:${sequence}:upstreamResMeta`;
+      const payload: SessionResponseMeta = {
+        url: sanitizeUrl(meta.url),
+        statusCode: meta.statusCode,
+      };
+      await redis.setex(key, SessionManager.SESSION_TTL, JSON.stringify(payload));
+    } catch (error) {
+      logger.error("SessionManager: Failed to store upstream response meta", { error, sessionId });
+    }
+  }
+
+  static async getSessionUpstreamResponseMeta(
+    sessionId: string,
+    requestSequence?: number
+  ): Promise<SessionResponseMeta | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence);
+      if (!sequence) return null;
+      const key = `session:${sessionId}:req:${sequence}:upstreamResMeta`;
+      const value = await redis.get(key);
+      if (!value) return null;
+
+      const parsed: unknown = JSON.parse(value);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      const obj = parsed as Record<string, unknown>;
+      if (typeof obj.url !== "string" || typeof obj.statusCode !== "number") return null;
+      return { url: obj.url, statusCode: obj.statusCode };
+    } catch (error) {
+      logger.error("SessionManager: Failed to get upstream response meta", { error, sessionId });
+      return null;
+    }
+  }
+
+  static async storeSessionRequestHeaders(
+    sessionId: string,
+    headers: Headers,
+    requestSequence?: number
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence) ?? 1;
+      const key = `session:${sessionId}:req:${sequence}:reqHeaders`;
+      const headersJson = JSON.stringify(headersToSanitizedObject(headers));
+      await redis.setex(key, SessionManager.SESSION_TTL, headersJson);
+      logger.trace("SessionManager: Stored session request headers", {
+        sessionId,
+        requestSequence: sequence,
+        key,
+      });
+    } catch (error) {
+      logger.error("SessionManager: Failed to store session request headers", { error, sessionId });
+    }
+  }
+
+  static async storeSessionResponseHeaders(
+    sessionId: string,
+    headers: Headers,
+    requestSequence?: number,
+    keyId?: number
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence) ?? 1;
+      await SessionManager.refreshSessionRequestOwner(redis, sessionId, sequence, keyId);
+      const key = `session:${sessionId}:req:${sequence}:resHeaders`;
+      const headersJson = JSON.stringify(headersToSanitizedObject(headers));
+      await redis.setex(key, SessionManager.SESSION_TTL, headersJson);
+      logger.trace("SessionManager: Stored session response headers", {
+        sessionId,
+        requestSequence: sequence,
+        key,
+      });
+    } catch (error) {
+      logger.error("SessionManager: Failed to store session response headers", {
+        error,
+        sessionId,
+      });
+    }
+  }
+
+  static async getSessionRequestHeaders(
+    sessionId: string,
+    requestSequence?: number
+  ): Promise<Record<string, string> | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence);
+      if (!sequence) return null;
+      const key = `session:${sessionId}:req:${sequence}:reqHeaders`;
+      const value = await redis.get(key);
+      if (!value) return null;
+      return parseHeaderRecord(value);
+    } catch (error) {
+      logger.error("SessionManager: Failed to get session request headers", { error, sessionId });
+      return null;
+    }
+  }
+
+  static async getSessionResponseHeaders(
+    sessionId: string,
+    requestSequence?: number
+  ): Promise<Record<string, string> | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence);
+      if (!sequence) return null;
+      const key = `session:${sessionId}:req:${sequence}:resHeaders`;
+      const value = await redis.get(key);
+      if (!value) return null;
+      return parseHeaderRecord(value);
+    } catch (error) {
+      logger.error("SessionManager: Failed to get session response headers", { error, sessionId });
+      return null;
+    }
+  }
+
+  /**
+   * 获取 session 响应体
+   *
+   * @param sessionId - Session ID
+   * @param requestSequence - 可选，请求序号。提供时读取特定请求的响应
+   * @returns 响应体内容（字符串）
+   */
+  static async getSessionResponse(
+    sessionId: string,
+    requestSequence?: number
+  ): Promise<string | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      if (requestSequence !== undefined) {
+        const sequence = normalizeRequestSequence(requestSequence);
+        if (sequence === null) return null;
+
+        const bundled = await readSessionResponseBodyBundleView(
+          redis,
+          sessionId,
+          sequence,
+          "legacy"
+        );
+        return bundled.body;
+      }
+
+      // 向后兼容：尝试旧格式
+      const legacyKey = `session:${sessionId}:response`;
+      const response = await redis.get(legacyKey);
+      return response;
+    } catch (error) {
+      logger.error("SessionManager: Failed to get session response", { error });
+      return null;
+    }
+  }
+
+  /**
+   * 按 before/after phase 存储请求快照。
+   * 该接口只新增独立 phase key，不替换旧混合 key，便于 action 侧渐进迁移。
+   */
+  static async storeSessionRequestPhaseSnapshot(
+    sessionId: string,
+    phase: SessionDetailViewMode,
+    snapshot: SessionDetailRequestSnapshotInput,
+    requestSequence?: number
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence) ?? 1;
+      const writes: Array<Promise<unknown>> = [];
+
+      if ("body" in snapshot) {
+        const rawBody = snapshot.body ?? null;
+        const bodyKey = buildSessionDetailSnapshotKey(
+          sessionId,
+          sequence,
+          "request",
+          phase,
+          "body"
+        );
+        if (canStoreSessionRequestArtifact(rawBody, `snapshot:${phase}:body`)) {
+          const normalizedBody = parseJsonStringIfPossible(rawBody);
+          const bodyToStore = SessionManager.STORE_MESSAGES
+            ? normalizedBody
+            : redactRequestBody(normalizedBody);
+          const bodyJson = JSON.stringify(bodyToStore);
+          if (canStoreSessionRequestArtifact(bodyJson, `snapshot:${phase}:body`)) {
+            writes.push(redis.setex(bodyKey, SessionManager.SESSION_TTL, bodyJson));
+          } else {
+            writes.push(redis.del(bodyKey));
+          }
+        } else {
+          writes.push(redis.del(bodyKey));
+        }
+      }
+
+      if ("messages" in snapshot) {
+        const rawMessages = snapshot.messages ?? null;
+        const messagesKey = buildSessionDetailSnapshotKey(
+          sessionId,
+          sequence,
+          "request",
+          phase,
+          "messages"
+        );
+        if (canStoreSessionRequestArtifact(rawMessages, `snapshot:${phase}:messages`)) {
+          const normalizedMessages = parseJsonStringIfPossible(rawMessages);
+          const messagesToStore = SessionManager.STORE_MESSAGES
+            ? normalizedMessages
+            : redactMessages(normalizedMessages);
+          const messagesJson = JSON.stringify(messagesToStore);
+          if (canStoreSessionRequestArtifact(messagesJson, `snapshot:${phase}:messages`)) {
+            writes.push(redis.setex(messagesKey, SessionManager.SESSION_TTL, messagesJson));
+          } else {
+            writes.push(redis.del(messagesKey));
+          }
+        } else {
+          writes.push(redis.del(messagesKey));
+        }
+      }
+
+      if ("headers" in snapshot) {
+        writes.push(
+          redis.setex(
+            buildSessionDetailSnapshotKey(sessionId, sequence, "request", phase, "headers"),
+            SessionManager.SESSION_TTL,
+            JSON.stringify(normalizeSnapshotHeaders(snapshot.headers))
+          )
+        );
+      }
+
+      if ("meta" in snapshot) {
+        writes.push(
+          redis.setex(
+            buildSessionDetailSnapshotKey(sessionId, sequence, "request", phase, "meta"),
+            SessionManager.SESSION_TTL,
+            JSON.stringify({
+              clientUrl:
+                typeof snapshot.meta?.clientUrl === "string"
+                  ? sanitizeUrl(snapshot.meta.clientUrl)
+                  : null,
+              upstreamUrl:
+                typeof snapshot.meta?.upstreamUrl === "string"
+                  ? sanitizeUrl(snapshot.meta.upstreamUrl)
+                  : null,
+              method: snapshot.meta?.method ?? null,
+            } satisfies SessionDetailRequestMeta)
+          )
+        );
+      }
+
+      await Promise.all(writes);
+    } catch (error) {
+      logger.error("SessionManager: Failed to store request detail snapshot", {
+        error,
+        sessionId,
+        phase,
+      });
+    }
+  }
+
+  static async getSessionRequestPhaseSnapshot(
+    sessionId: string,
+    phase: SessionDetailViewMode,
+    requestSequence?: number
+  ): Promise<SessionDetailRequestSnapshot | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence);
+      if (!sequence) return null;
+
+      const [bodyValue, messagesValue, headersValue, metaValue] = await Promise.all([
+        redis.get(buildSessionDetailSnapshotKey(sessionId, sequence, "request", phase, "body")),
+        redis.get(buildSessionDetailSnapshotKey(sessionId, sequence, "request", phase, "messages")),
+        redis.get(buildSessionDetailSnapshotKey(sessionId, sequence, "request", phase, "headers")),
+        redis.get(buildSessionDetailSnapshotKey(sessionId, sequence, "request", phase, "meta")),
+      ]);
+
+      if (
+        bodyValue === null &&
+        messagesValue === null &&
+        headersValue === null &&
+        metaValue === null
+      ) {
+        return null;
+      }
+
+      return {
+        body: bodyValue === null ? null : (JSON.parse(bodyValue) as unknown),
+        messages: messagesValue === null ? null : (JSON.parse(messagesValue) as unknown),
+        headers: headersValue === null ? null : parseHeaderRecord(headersValue),
+        meta:
+          metaValue === null
+            ? { clientUrl: null, upstreamUrl: null, method: null }
+            : (parseSessionDetailRequestMeta(metaValue) ?? {
+                clientUrl: null,
+                upstreamUrl: null,
+                method: null,
+              }),
+      };
+    } catch (error) {
+      logger.error("SessionManager: Failed to get request detail snapshot", {
+        error,
+        sessionId,
+        phase,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * 按 before/after phase 存储响应快照。
+   * before 用于记录原始上游结果，after 用于记录返回客户端的最终结果。
+   */
+  static async storeSessionResponsePhaseSnapshot(
+    sessionId: string,
+    phase: SessionDetailViewMode,
+    snapshot: SessionDetailResponseSnapshotInput,
+    requestSequence?: number,
+    keyId?: number
+  ): Promise<void> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence) ?? 1;
+      await SessionManager.refreshSessionRequestOwner(redis, sessionId, sequence, keyId);
+      const writes: Array<Promise<unknown>> = [];
+
+      if ("body" in snapshot) {
+        if (!getEnvConfig().STORE_SESSION_RESPONSE_BODY) {
+          // 与旧平铺 response 字段保持同一隐私/存储契约：关闭时跳过任何 response body phase 落盘。
+        } else {
+          let bodyToStore = snapshot.body ?? null;
+          let bodyExceededLimit = false;
+          const bodyKey = buildSessionDetailSnapshotKey(
+            sessionId,
+            sequence,
+            "response",
+            phase,
+            "body"
+          );
+
+          if (
+            typeof bodyToStore === "string" &&
+            !canStoreSessionResponseBody(bodyToStore, `snapshot:${phase}`)
+          ) {
+            bodyToStore = null;
+            bodyExceededLimit = true;
+          }
+
+          if (bodyToStore !== null && !SessionManager.STORE_MESSAGES) {
+            if (typeof bodyToStore === "string") {
+              try {
+                bodyToStore = JSON.stringify(
+                  redactResponseBody(JSON.parse(bodyToStore) as unknown)
+                );
+              } catch {
+                bodyToStore = snapshot.body ?? null;
+              }
+            } else if (bodyToStore !== null) {
+              bodyToStore = JSON.stringify(redactResponseBody(bodyToStore));
+            }
+          } else if (bodyToStore !== null && typeof bodyToStore !== "string") {
+            bodyToStore = JSON.stringify(bodyToStore);
+          }
+
+          if (
+            bodyToStore !== null &&
+            canStoreSessionResponseBody(bodyToStore, `snapshot:${phase}`)
+          ) {
+            writes.push(redis.setex(bodyKey, SessionManager.SESSION_TTL, bodyToStore));
+          } else if (bodyToStore !== null) {
+            bodyExceededLimit = true;
+          }
+
+          if (bodyExceededLimit) {
+            // 同一 request/phase 可能被重写；超限时删除旧正文，避免读取到上一版小响应。
+            writes.push(redis.del(bodyKey));
+          }
+        }
+      }
+
+      if ("headers" in snapshot) {
+        writes.push(
+          redis.setex(
+            buildSessionDetailSnapshotKey(sessionId, sequence, "response", phase, "headers"),
+            SessionManager.SESSION_TTL,
+            JSON.stringify(normalizeSnapshotHeaders(snapshot.headers))
+          )
+        );
+      }
+
+      if ("meta" in snapshot) {
+        writes.push(
+          redis.setex(
+            buildSessionDetailSnapshotKey(sessionId, sequence, "response", phase, "meta"),
+            SessionManager.SESSION_TTL,
+            JSON.stringify({
+              upstreamUrl:
+                typeof snapshot.meta?.upstreamUrl === "string"
+                  ? sanitizeUrl(snapshot.meta.upstreamUrl)
+                  : null,
+              statusCode: snapshot.meta?.statusCode ?? null,
+            } satisfies SessionDetailResponseMeta)
+          )
+        );
+      }
+
+      await Promise.all(writes);
+    } catch (error) {
+      logger.error("SessionManager: Failed to store response detail snapshot", {
+        error,
+        sessionId,
+        phase,
+      });
+    }
+  }
+
+  static async getSessionResponsePhaseSnapshot(
+    sessionId: string,
+    phase: SessionDetailViewMode,
+    requestSequence?: number
+  ): Promise<SessionDetailResponseSnapshot | null> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") return null;
+
+    try {
+      const sequence = normalizeRequestSequence(requestSequence);
+      if (!sequence) return null;
+
+      const bundled = await readSessionResponseBodyBundleView(redis, sessionId, sequence, phase);
+      const [headersValue, metaValue] = await Promise.all([
+        redis.get(buildSessionDetailSnapshotKey(sessionId, sequence, "response", phase, "headers")),
+        redis.get(buildSessionDetailSnapshotKey(sessionId, sequence, "response", phase, "meta")),
+      ]);
+      const bodyValue = bundled.body;
+
+      if (
+        bodyValue === null &&
+        headersValue === null &&
+        metaValue === null &&
+        (!bundled.exists || !bundled.present)
+      ) {
+        return null;
+      }
+
+      return {
+        body: bodyValue,
+        headers: headersValue === null ? null : parseHeaderRecord(headersValue),
+        meta:
+          metaValue === null
+            ? { upstreamUrl: null, statusCode: null }
+            : (parseSessionDetailResponseMeta(metaValue) ?? {
+                upstreamUrl: null,
+                statusCode: null,
+              }),
+      };
+    } catch (error) {
+      logger.error("SessionManager: Failed to get response detail snapshot", {
+        error,
+        sessionId,
+        phase,
+      });
+      return null;
+    }
+  }
+
+  /**
+   * 从 Codex 响应中提取 prompt_cache_key 作为 Session ID
+   *
+   * Codex 响应中包含 prompt_cache_key 字段（UUID 格式），用于标识缓存上下文。
+   * 这个字段出现在 response.created、response.in_progress、response.completed 等事件中。
+   *
+   * @param responseData - Codex 响应数据（流式事件的 data 部分或完整响应）
+   * @returns prompt_cache_key 或 null
+   */
+  static extractCodexPromptCacheKey(responseData: Record<string, unknown>): string | null {
+    // 检查 response 对象中的 prompt_cache_key（SSE 事件格式）
+    const response = responseData.response as Record<string, unknown> | undefined;
+    if (
+      response &&
+      typeof response.prompt_cache_key === "string" &&
+      response.prompt_cache_key.length > 0
+    ) {
+      logger.trace("SessionManager: Extracted prompt_cache_key from response object", {
+        promptCacheKey: response.prompt_cache_key,
+      });
+      return response.prompt_cache_key;
+    }
+
+    // 备选：直接在顶层检查（非流式响应格式）
+    if (
+      typeof responseData.prompt_cache_key === "string" &&
+      responseData.prompt_cache_key.length > 0
+    ) {
+      logger.trace("SessionManager: Extracted prompt_cache_key from top level", {
+        promptCacheKey: responseData.prompt_cache_key,
+      });
+      return responseData.prompt_cache_key;
+    }
+
+    return null;
+  }
+
+  /**
+   * 使用 Codex 的 prompt_cache_key 更新 Session 绑定
+   *
+   * 策略：如果响应中包含 prompt_cache_key，使用它作为 Session ID 的来源。
+   * 这类似于 Claude 从请求 metadata 中提取 session_id 的机制。
+   *
+   * Session ID 格式：codex_{prompt_cache_key}（添加前缀以区分来源）
+   *
+   * @param currentSessionId - 当前的 Session ID（可能是生成的或从请求提取的）
+   * @param promptCacheKey - Codex 响应中的 prompt_cache_key
+   * @param providerId - 供应商 ID
+   * @returns 更新后的 Session ID 和是否创建了新绑定
+   */
+  static async updateSessionWithCodexCacheKey(
+    currentSessionId: string,
+    promptCacheKey: string,
+    providerId: number,
+    keyId?: number | null
+  ): Promise<{ sessionId: string; updated: boolean }> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") {
+      logger.debug("SessionManager: Redis not ready, skipping Codex session update");
+      return { sessionId: currentSessionId, updated: false };
+    }
+
+    try {
+      // 使用 prompt_cache_key 作为新的 Session ID（添加前缀以区分）
+      const codexSessionId = `codex_${promptCacheKey}`;
+
+      if (keyId != null) {
+        const binding = await readOrReconcileSessionBinding({
+          sessionId: codexSessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+        });
+        if (binding.status === "ok") {
+          if (binding.snapshot.providerId !== null) {
+            logger.debug("SessionManager: Refreshed versioned Codex session TTL", {
+              sessionId: codexSessionId,
+              providerId: binding.snapshot.providerId,
+            });
+            return { sessionId: codexSessionId, updated: false };
+          }
+
+          const updated = await compareAndSetSessionBinding({
+            sessionId: codexSessionId,
+            keyId,
+            expectedGeneration: binding.snapshot.generation,
+            providerId,
+            ttlSeconds: SessionManager.SESSION_TTL,
+            redis,
+          });
+          if (updated.status === "ok") {
+            logger.info("SessionManager: Created versioned Codex session", {
+              sessionId: codexSessionId,
+              providerId,
+            });
+            return { sessionId: codexSessionId, updated: true };
+          }
+          return { sessionId: currentSessionId, updated: false };
+        }
+        if (!binding.legacyFallbackAllowed) {
+          logger.warn("SessionManager: Codex session binding owner could not be verified", {
+            sessionId: codexSessionId,
+            keyId,
+            reason: binding.reason,
+          });
+          return { sessionId: currentSessionId, updated: false };
+        }
+        const legacy = await mutateLegacySessionBindingSafely({
+          sessionId: codexSessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+          mutation: { type: "inspect" },
+        });
+        if (legacy.status !== "ok") {
+          logger.warn("SessionManager: Legacy Codex binding owner could not be verified", {
+            sessionId: codexSessionId,
+            keyId,
+            reason: legacy.reason,
+          });
+          return { sessionId: currentSessionId, updated: false };
+        }
+
+        if (legacy.providerId !== null) {
+          await mutateLegacySessionBindingSafely({
+            sessionId: codexSessionId,
+            keyId,
+            ttlSeconds: SessionManager.SESSION_TTL,
+            redis,
+            mutation: { type: "refresh" },
+          });
+          return { sessionId: codexSessionId, updated: false };
+        }
+
+        const bound = await mutateLegacySessionBindingSafely({
+          sessionId: codexSessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+          mutation: { type: "bind_if_absent", providerId },
+        });
+        if (bound.status === "ok") {
+          return { sessionId: codexSessionId, updated: bound.changed };
+        }
+        return { sessionId: currentSessionId, updated: false };
+      }
+
+      logger.warn("SessionManager: Cannot bind Codex session without an API key owner", {
+        sessionId: codexSessionId,
+      });
+      return { sessionId: currentSessionId, updated: false };
+    } catch (error) {
+      logger.error("SessionManager: Failed to update Codex session", { error });
+      return { sessionId: currentSessionId, updated: false };
+    }
+  }
+
+  /**
+   * 终止 Session（主动打断）
+   *
+   * 功能：删除 Session 在 Redis 中的所有绑定关系，强制下次请求重新选择供应商
+   * 用途：管理员主动打断长时间占用同一供应商的 Session
+   *
+   * @param sessionId - Session ID
+   * @returns 是否成功删除
+   */
+  static async terminateSession(
+    sessionId: string,
+    expectedProviderIds?: readonly number[],
+    expectedKeyId?: number
+  ): Promise<boolean> {
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") {
+      logger.warn("SessionManager: Redis not ready, cannot terminate session");
+      return false;
+    }
+
+    try {
+      // 1. 先查询绑定信息（用于从 ZSET 中移除）
+      let providerId: number | null = null;
+      let keyId: number | null = null;
+      let userId: number | null = null;
+      let bindingTerminated = false;
+
+      try {
+        const [providerIdStr, keyIdStr, userIdStr] = await Promise.all([
+          redis.get(`session:${sessionId}:provider`),
+          redis.get(`session:${sessionId}:key`),
+          redis.hget(`session:${sessionId}:info`, "userId"),
+        ]);
+
+        providerId = providerIdStr ? Number(providerIdStr) : null;
+        keyId = keyIdStr ? Number(keyIdStr) : null;
+        userId = userIdStr ? Number(userIdStr) : null;
+
+        if (providerId !== null && (!Number.isSafeInteger(providerId) || providerId <= 0)) {
+          providerId = null;
+        }
+        if (keyId !== null && (!Number.isSafeInteger(keyId) || keyId <= 0)) {
+          keyId = null;
+        }
+        if (userId !== null && (!Number.isSafeInteger(userId) || userId <= 0)) {
+          userId = null;
+        }
+        if (expectedKeyId !== undefined && keyId !== expectedKeyId) {
+          logger.warn("SessionManager: Session owner changed before termination", {
+            sessionId,
+            expectedKeyId,
+            actualKeyId: keyId,
+          });
+          return false;
+        }
+      } catch (lookupError) {
+        if (expectedKeyId !== undefined) {
+          logger.warn("SessionManager: Failed to verify session owner before termination", {
+            sessionId,
+            expectedKeyId,
+            error: lookupError,
+          });
+          return false;
+        }
+
+        // Redis 查询失败不应阻止清理操作，继续执行删除
+        logger.warn(
+          "SessionManager: Failed to lookup session binding info, continuing with cleanup",
+          {
+            sessionId,
+            error: lookupError,
+          }
+        );
+      }
+
+      if (keyId !== null) {
+        const binding = await readOrReconcileSessionBinding({
+          sessionId,
+          keyId,
+          ttlSeconds: SessionManager.SESSION_TTL,
+          redis,
+        });
+        if (binding.status === "ok") {
+          providerId = binding.snapshot.providerId ?? providerId;
+          if (
+            expectedProviderIds &&
+            (binding.snapshot.providerId === null ||
+              !expectedProviderIds.includes(binding.snapshot.providerId))
+          ) {
+            return false;
+          }
+
+          const terminated = await terminateVersionedSessionBinding({
+            sessionId,
+            keyId,
+            expectedProviderId: expectedProviderIds
+              ? (binding.snapshot.providerId ?? undefined)
+              : undefined,
+            ttlSeconds: SessionManager.SESSION_TTL,
+            redis,
+          });
+          if (terminated.status !== "ok") {
+            logger.warn("SessionManager: Versioned session termination blocked", {
+              sessionId,
+              keyId,
+              reason: terminated.reason,
+            });
+            return false;
+          }
+
+          if (expectedProviderIds) {
+            const terminatedProviderId = binding.snapshot.providerId;
+            if (terminatedProviderId === null) {
+              logger.warn("SessionManager: Scoped versioned termination lost Provider identity", {
+                sessionId,
+                keyId,
+              });
+              return false;
+            }
+
+            // The versioned CAS above is the linearization point. A failover
+            // may bind this Session to Q immediately afterwards, so scoped
+            // invalidation must only remove P's Provider-owned indexes.
+            try {
+              const providerCleanup = redis.pipeline();
+              providerCleanup.zrem(`provider:${terminatedProviderId}:active_sessions`, sessionId);
+              providerCleanup.hdel(
+                `provider:${terminatedProviderId}:active_session_refs`,
+                sessionId
+              );
+              await providerCleanup.exec();
+            } catch (cleanupError) {
+              logger.warn("SessionManager: Scoped versioned Provider index cleanup failed", {
+                sessionId,
+                providerId: terminatedProviderId,
+                error: cleanupError,
+              });
+            }
+
+            logger.info("SessionManager: Cleared scoped versioned Provider binding", {
+              sessionId,
+              providerId: terminatedProviderId,
+              keyId,
+            });
+            return true;
+          }
+
+          bindingTerminated = true;
+        } else if (binding.status === "unavailable" && binding.legacyFallbackAllowed) {
+          const legacy = await mutateLegacySessionBindingSafely({
+            sessionId,
+            keyId,
+            ttlSeconds: SessionManager.SESSION_TTL,
+            redis,
+            mutation: { type: "terminate", expectedProviderIds },
+          });
+          if (legacy.status !== "ok") {
+            logger.warn("SessionManager: Legacy session termination blocked", {
+              sessionId,
+              keyId,
+              reason: legacy.reason,
+            });
+            return false;
+          }
+
+          if (expectedProviderIds) {
+            const terminatedProviderId = legacy.terminatedProviderId;
+            if (terminatedProviderId == null) {
+              logger.warn("SessionManager: Scoped legacy termination lost Provider identity", {
+                sessionId,
+                keyId,
+              });
+              return false;
+            }
+
+            // The helper's value-checked delete is the linearization point. A
+            // failover may bind this Session to Q immediately afterwards, so
+            // provider-scoped invalidation must not delete shared Session
+            // metadata or global/key/user indexes after removing P.
+            try {
+              const providerCleanup = redis.pipeline();
+              providerCleanup.zrem(`provider:${terminatedProviderId}:active_sessions`, sessionId);
+              providerCleanup.hdel(
+                `provider:${terminatedProviderId}:active_session_refs`,
+                sessionId
+              );
+              await providerCleanup.exec();
+            } catch (cleanupError) {
+              logger.warn("SessionManager: Scoped legacy Provider index cleanup failed", {
+                sessionId,
+                providerId: terminatedProviderId,
+                error: cleanupError,
+              });
+            }
+
+            logger.info("SessionManager: Cleared scoped legacy Provider binding", {
+              sessionId,
+              providerId: terminatedProviderId,
+              keyId,
+            });
+            return true;
+          }
+
+          bindingTerminated = true;
+        } else {
+          logger.warn("SessionManager: Session binding termination blocked", {
+            sessionId,
+            keyId,
+            reason: binding.reason,
+          });
+          return false;
+        }
+      } else if (providerId !== null || expectedProviderIds) {
+        logger.warn("SessionManager: Session binding owner unavailable during termination", {
+          sessionId,
+          providerId,
+        });
+        return false;
+      }
+
+      // A binding-aware termination must succeed before any session metadata or
+      // active-session indexes are removed. This guard keeps a future mutation
+      // path from turning a CAS/mirror conflict into a misleading success based
+      // only on unrelated metadata deletions.
+      if (keyId !== null && !bindingTerminated) {
+        logger.warn("SessionManager: Session binding was not terminated", {
+          sessionId,
+          keyId,
+        });
+        return false;
+      }
+
+      // 2. 删除所有 Session 相关的 key
+      const pipeline = redis.pipeline();
+
+      // Binding mirrors are mutated only by the tenant-authorized helpers above.
+      pipeline.eval(
+        DELETE_SESSION_RESPONSE_BODY_BUNDLES_LUA,
+        5,
+        buildSessionResponseBodyBundleIndexKey(sessionId),
+        buildSessionResponseBodyGenerationKey(sessionId),
+        `session:${sessionId}:response`,
+        buildLegacySessionResponseBodyViewKey(sessionId, 1, "before"),
+        buildLegacySessionResponseBodyViewKey(sessionId, 1, "after"),
+        SessionManager.SESSION_TTL,
+        crypto.randomUUID()
+      );
+      pipeline.del(`session:${sessionId}:info`);
+      pipeline.del(`session:${sessionId}:last_seen`);
+      pipeline.del(`session:${sessionId}:concurrent_count`);
+
+      // 可选：messages 和 response（如果启用了存储）
+      pipeline.del(`session:${sessionId}:messages`);
+
+      // 3. 从 ZSET 中移除（始终尝试，即使查询失败）
+      pipeline.zrem(getGlobalActiveSessionsKey(), sessionId);
+
+      if (providerId) {
+        pipeline.zrem(`provider:${providerId}:active_sessions`, sessionId);
+        pipeline.hdel(`provider:${providerId}:active_session_refs`, sessionId);
+      }
+
+      if (keyId) {
+        pipeline.zrem(getKeyActiveSessionsKey(keyId), sessionId);
+      }
+
+      if (userId) {
+        pipeline.zrem(getUserActiveSessionsKey(userId), sessionId);
+      }
+
+      // 4. 删除 hash 映射（如果存在）
+      // 注意：无法直接反查 hash，只能清理已知的 session key
+      // hash 会在 TTL 后自动过期，不影响功能
+
+      const results = await pipeline.exec();
+
+      // 5. 检查结果
+      let deletedKeys = 0;
+      if (results) {
+        for (const [err, result] of results) {
+          if (!err && typeof result === "number" && result > 0) {
+            deletedKeys += result;
+          }
+        }
+      }
+
+      logger.info("SessionManager: Terminated session", {
+        sessionId,
+        providerId,
+        keyId,
+        deletedKeys,
+      });
+
+      return bindingTerminated || deletedKeys > 0;
+    } catch (error) {
+      logger.error("SessionManager: Failed to terminate session", {
+        error,
+        sessionId,
+      });
+      return false;
+    }
+  }
+
+  static async terminateProviderSessionsBatch(providerIds: number[]): Promise<number> {
+    const uniqueProviderIds = Array.from(
+      new Set(providerIds.filter((providerId) => Number.isInteger(providerId) && providerId > 0))
+    );
+    if (uniqueProviderIds.length === 0) {
+      return 0;
+    }
+
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") {
+      logger.warn("SessionManager: Redis not ready, cannot terminate provider sessions");
+      return 0;
+    }
+
+    try {
+      const pipeline = redis.pipeline();
+      for (const providerId of uniqueProviderIds) {
+        pipeline.zrange(`provider:${providerId}:active_sessions`, "0", "-1");
+      }
+
+      const results = await pipeline.exec();
+      if (!results) {
+        return 0;
+      }
+
+      const sessionIds = new Set<string>();
+      for (const [err, result] of results) {
+        if (err) {
+          logger.warn("SessionManager: Pipeline command error in terminateProviderSessionsBatch", {
+            error: err,
+          });
+          continue;
+        }
+        if (!Array.isArray(result)) {
+          continue;
+        }
+
+        for (const sessionId of result) {
+          if (typeof sessionId === "string" && sessionId.trim()) {
+            sessionIds.add(sessionId);
+          }
+        }
+      }
+
+      if (sessionIds.size === 0) {
+        return 0;
+      }
+
+      const terminatedCount = await SessionManager.terminateSessionsBatch(
+        [...sessionIds],
+        uniqueProviderIds
+      );
+      logger.info("SessionManager: Terminated provider sessions batch", {
+        providerIds: uniqueProviderIds,
+        sessionCount: sessionIds.size,
+        terminatedCount,
+      });
+      return terminatedCount;
+    } catch (error) {
+      logger.error("SessionManager: Failed to terminate provider sessions batch", {
+        error,
+        providerIds: uniqueProviderIds,
+      });
+      return 0;
+    }
+  }
+
+  static async terminateStickySessionsForProviders(
+    providerIds: number[],
+    context: string
+  ): Promise<void> {
+    const uniqueProviderIds = Array.from(
+      new Set(providerIds.filter((providerId) => Number.isInteger(providerId) && providerId > 0))
+    );
+    if (uniqueProviderIds.length === 0) {
+      return;
+    }
+
+    try {
+      await SessionManager.terminateProviderSessionsBatch(uniqueProviderIds);
+    } catch (error) {
+      logger.warn(`${context}:terminate_provider_sessions_failed`, {
+        providerIds: uniqueProviderIds,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * 批量终止 Session
+   *
+   * 采用分块处理策略，避免大批量操作时对 Redis 造成过大压力
+   *
+   * @param sessionIds - Session ID 列表
+   * @returns 成功终止的数量
+   */
+  static async terminateSessionsBatch(
+    sessionIds: string[],
+    expectedProviderIds?: readonly number[]
+  ): Promise<number> {
+    if (sessionIds.length === 0) {
+      return 0;
+    }
+
+    const redis = getRedisClient();
+    if (redis?.status !== "ready") {
+      logger.warn("SessionManager: Redis not ready, cannot terminate sessions");
+      return 0;
+    }
+
+    try {
+      // 分块处理，每批 20 个，避免并发过高
+      const CHUNK_SIZE = 20;
+      let successCount = 0;
+
+      for (let i = 0; i < sessionIds.length; i += CHUNK_SIZE) {
+        const chunk = sessionIds.slice(i, i + CHUNK_SIZE);
+        const results = await Promise.all(
+          chunk.map(async (sessionId) => {
+            const success = await SessionManager.terminateSession(sessionId, expectedProviderIds);
+            return success ? 1 : 0;
+          })
+        );
+        successCount += results.reduce<number>((sum, value) => sum + value, 0);
+      }
+
+      logger.info("SessionManager: Terminated sessions batch", {
+        total: sessionIds.length,
+        successCount,
+      });
+
+      return successCount;
+    } catch (error) {
+      logger.error("SessionManager: Failed to terminate sessions batch", {
+        error,
+      });
+      return 0;
+    }
+  }
+}
+
+export { headersToSanitizedObject, parseHeaderRecord };

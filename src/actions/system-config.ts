@@ -1,0 +1,331 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { ZodError } from "zod";
+import { locales } from "@/i18n/config";
+import { emitActionAudit } from "@/lib/audit/emit";
+import { getSession } from "@/lib/auth";
+import { invalidateSystemSettingsCache } from "@/lib/config";
+import { DEFAULT_SETTINGS } from "@/lib/config/system-settings-cache";
+import { logger } from "@/lib/logger";
+import { publishCurrentPublicStatusConfigProjection } from "@/lib/public-status/config-publisher";
+import { schedulePublicStatusRebuild } from "@/lib/public-status/rebuild-hints";
+import {
+  invalidateAllLeaderboardCaches,
+  invalidateAllOverviewCaches,
+  invalidateAllStatisticsCaches,
+} from "@/lib/redis";
+import { resolveSystemTimezone } from "@/lib/utils/timezone";
+import {
+  DISCOVERY_WINDOW_INVALID_ERROR_CODE,
+  getDiscoveryValidationErrorCode,
+} from "@/lib/validation/discovery-settings";
+import {
+  getReplayCacheTtlValidationErrorCode,
+  REPLAY_CACHE_TTL_INVALID_ERROR_CODE,
+} from "@/lib/validation/replay-settings";
+import { UpdateSystemSettingsSchema } from "@/lib/validation/schemas";
+import { getSystemSettings, updateSystemSettings } from "@/repository/system-config";
+import type { IpExtractionConfig } from "@/types/ip-extraction";
+import type {
+  CodexPriorityBillingSource,
+  FakeStreamingWhitelistEntry,
+  ResponseFixerConfig,
+  StreamGateSettingMode,
+  SystemSettings,
+} from "@/types/system-config";
+import type { ActionResult } from "./types";
+
+function systemSettingsValidationErrorCode(error: unknown): string | null {
+  if (!(error instanceof ZodError)) return null;
+  return (
+    getDiscoveryValidationErrorCode(error.issues) ??
+    getReplayCacheTtlValidationErrorCode(error.issues) ??
+    null
+  );
+}
+
+export async function fetchSystemSettings(): Promise<ActionResult<SystemSettings>> {
+  try {
+    const session = await getSession();
+    if (session?.user.role !== "admin") {
+      return { ok: false, error: "无权限访问系统设置" };
+    }
+
+    const settings = await getSystemSettings();
+    return { ok: true, data: settings };
+  } catch (error) {
+    logger.error("获取系统设置失败:", error);
+    return { ok: false, error: "获取系统设置失败" };
+  }
+}
+
+export async function getServerTimeZone(): Promise<ActionResult<{ timeZone: string }>> {
+  try {
+    const session = await getSession();
+    if (!session) {
+      return { ok: false, error: "未授权" };
+    }
+
+    const timeZone = await resolveSystemTimezone();
+    return { ok: true, data: { timeZone } };
+  } catch (error) {
+    logger.error("获取时区失败:", error);
+    return { ok: false, error: "获取时区失败" };
+  }
+}
+
+export async function saveSystemSettings(formData: {
+  // 所有字段均为可选，支持部分更新
+  siteTitle?: string;
+  allowGlobalUsageView?: boolean;
+  currencyDisplay?: string;
+  billingModelSource?: string;
+  codexPriorityBillingSource?: CodexPriorityBillingSource;
+  billNonSuccessfulRequests?: boolean;
+  billHedgeLosers?: boolean;
+  legacyHedgeMaxInFlight?: number;
+  discoveryEnabled?: boolean;
+  discoveryConcurrency?: number;
+  maxDiscoveryRounds?: number;
+  discoverySlaMs?: number;
+  stickySlaMs?: number;
+  racingTotalTimeoutMs?: number;
+  stickyTimeoutCooldownMs?: number;
+  timezone?: string | null;
+  enableAutoCleanup?: boolean;
+  cleanupRetentionDays?: number;
+  cleanupSchedule?: string;
+  cleanupBatchSize?: number;
+  enableClientVersionCheck?: boolean;
+  verboseProviderError?: boolean;
+  passThroughUpstreamErrorMessage?: boolean;
+  enableHttp2?: boolean;
+  enableOpenaiResponsesWebsocket?: boolean;
+  enableHighConcurrencyMode?: boolean;
+  interceptAnthropicWarmupRequests?: boolean;
+  enableThinkingSignatureRectifier?: boolean;
+  enableThinkingBudgetRectifier?: boolean;
+  enableThinkingEffortConflictRectifier?: boolean;
+  enableGeminiFunctionIdRectifier?: boolean;
+  enableBillingHeaderRectifier?: boolean;
+  enableResponseInputRectifier?: boolean;
+  allowNonConversationEndpointProviderFallback?: boolean;
+  fakeStreamingWhitelist?: FakeStreamingWhitelistEntry[];
+  streamGateMode?: StreamGateSettingMode;
+  affinityIgnoreClientSessionId?: boolean;
+  replayEnabled?: boolean | null;
+  replayCacheTtlMinutes?: number;
+  cacheEffectivenessEnabled?: boolean | null;
+  enableCodexSessionIdCompletion?: boolean;
+  enableClaudeMetadataUserIdInjection?: boolean;
+  enableResponseFixer?: boolean;
+  responseFixerConfig?: Partial<ResponseFixerConfig>;
+  // Quota lease settings
+  quotaDbRefreshIntervalSeconds?: number;
+  quotaLeasePercent5h?: number;
+  quotaLeasePercentDaily?: number;
+  quotaLeasePercentWeekly?: number;
+  quotaLeasePercentMonthly?: number;
+  quotaLeaseCapUsd?: number | null;
+  publicStatusWindowHours?: number;
+  publicStatusAggregationIntervalMinutes?: number;
+  // IP 提取 / 归属地查询
+  ipExtractionConfig?: IpExtractionConfig | null;
+  ipGeoLookupEnabled?: boolean;
+}): Promise<ActionResult<SystemSettings & { publicStatusProjectionWarningCode?: string | null }>> {
+  let before: SystemSettings | null = null;
+  try {
+    const session = await getSession();
+    if (session?.user.role !== "admin") {
+      return { ok: false, error: "无权限执行此操作" };
+    }
+
+    before = await getSystemSettings();
+    const validated = UpdateSystemSettingsSchema.parse(formData);
+    const effectiveDiscoveryWindow = {
+      discoverySlaMs:
+        validated.discoverySlaMs ?? before?.discoverySlaMs ?? DEFAULT_SETTINGS.discoverySlaMs,
+      stickySlaMs: validated.stickySlaMs ?? before?.stickySlaMs ?? DEFAULT_SETTINGS.stickySlaMs,
+      maxDiscoveryRounds:
+        validated.maxDiscoveryRounds ??
+        before?.maxDiscoveryRounds ??
+        DEFAULT_SETTINGS.maxDiscoveryRounds,
+      racingTotalTimeoutMs:
+        validated.racingTotalTimeoutMs ??
+        before?.racingTotalTimeoutMs ??
+        DEFAULT_SETTINGS.racingTotalTimeoutMs,
+    };
+    if (
+      effectiveDiscoveryWindow.racingTotalTimeoutMs <
+      effectiveDiscoveryWindow.stickySlaMs +
+        effectiveDiscoveryWindow.maxDiscoveryRounds * effectiveDiscoveryWindow.discoverySlaMs
+    ) {
+      return {
+        ok: false,
+        error: "Discovery window validation failed.",
+        errorCode: DISCOVERY_WINDOW_INVALID_ERROR_CODE,
+      };
+    }
+    const updated = await updateSystemSettings({
+      siteTitle: validated.siteTitle?.trim(),
+      allowGlobalUsageView: validated.allowGlobalUsageView,
+      currencyDisplay: validated.currencyDisplay,
+      billingModelSource: validated.billingModelSource,
+      codexPriorityBillingSource: validated.codexPriorityBillingSource,
+      billNonSuccessfulRequests: validated.billNonSuccessfulRequests,
+      billHedgeLosers: validated.billHedgeLosers,
+      legacyHedgeMaxInFlight: validated.legacyHedgeMaxInFlight,
+      discoveryEnabled: validated.discoveryEnabled,
+      discoveryConcurrency: validated.discoveryConcurrency,
+      maxDiscoveryRounds: validated.maxDiscoveryRounds,
+      discoverySlaMs: validated.discoverySlaMs,
+      stickySlaMs: validated.stickySlaMs,
+      racingTotalTimeoutMs: validated.racingTotalTimeoutMs,
+      stickyTimeoutCooldownMs: validated.stickyTimeoutCooldownMs,
+      timezone: validated.timezone,
+      enableAutoCleanup: validated.enableAutoCleanup,
+      cleanupRetentionDays: validated.cleanupRetentionDays,
+      cleanupSchedule: validated.cleanupSchedule,
+      cleanupBatchSize: validated.cleanupBatchSize,
+      enableClientVersionCheck: validated.enableClientVersionCheck,
+      verboseProviderError: validated.verboseProviderError,
+      passThroughUpstreamErrorMessage: validated.passThroughUpstreamErrorMessage,
+      enableHttp2: validated.enableHttp2,
+      enableOpenaiResponsesWebsocket: validated.enableOpenaiResponsesWebsocket,
+      enableHighConcurrencyMode: validated.enableHighConcurrencyMode,
+      interceptAnthropicWarmupRequests: validated.interceptAnthropicWarmupRequests,
+      enableThinkingSignatureRectifier: validated.enableThinkingSignatureRectifier,
+      enableThinkingBudgetRectifier: validated.enableThinkingBudgetRectifier,
+      enableThinkingEffortConflictRectifier: validated.enableThinkingEffortConflictRectifier,
+      enableGeminiFunctionIdRectifier: validated.enableGeminiFunctionIdRectifier,
+      enableBillingHeaderRectifier: validated.enableBillingHeaderRectifier,
+      enableResponseInputRectifier: validated.enableResponseInputRectifier,
+      allowNonConversationEndpointProviderFallback:
+        validated.allowNonConversationEndpointProviderFallback,
+      fakeStreamingWhitelist: validated.fakeStreamingWhitelist,
+      streamGateMode: validated.streamGateMode,
+      affinityIgnoreClientSessionId: validated.affinityIgnoreClientSessionId,
+      replayEnabled: validated.replayEnabled,
+      replayCacheTtlMinutes: validated.replayCacheTtlMinutes,
+      cacheEffectivenessEnabled: validated.cacheEffectivenessEnabled,
+      enableCodexSessionIdCompletion: validated.enableCodexSessionIdCompletion,
+      enableClaudeMetadataUserIdInjection: validated.enableClaudeMetadataUserIdInjection,
+      enableResponseFixer: validated.enableResponseFixer,
+      responseFixerConfig: validated.responseFixerConfig,
+      quotaDbRefreshIntervalSeconds: validated.quotaDbRefreshIntervalSeconds,
+      quotaLeasePercent5h: validated.quotaLeasePercent5h,
+      quotaLeasePercentDaily: validated.quotaLeasePercentDaily,
+      quotaLeasePercentWeekly: validated.quotaLeasePercentWeekly,
+      quotaLeasePercentMonthly: validated.quotaLeasePercentMonthly,
+      quotaLeaseCapUsd: validated.quotaLeaseCapUsd,
+      publicStatusWindowHours: validated.publicStatusWindowHours,
+      publicStatusAggregationIntervalMinutes: validated.publicStatusAggregationIntervalMinutes,
+      ipExtractionConfig: validated.ipExtractionConfig,
+      ipGeoLookupEnabled: validated.ipGeoLookupEnabled,
+    });
+
+    // Invalidate the system settings cache so proxy requests get fresh settings
+    invalidateSystemSettingsCache();
+
+    if (validated.timezone !== undefined) {
+      await Promise.all([
+        invalidateAllOverviewCaches(),
+        invalidateAllStatisticsCaches(),
+        invalidateAllLeaderboardCaches(),
+      ]).catch((error) => {
+        logger.warn("[SystemSettings] Failed to invalidate timezone-sensitive dashboard caches", {
+          error,
+        });
+      });
+    }
+
+    const shouldRepublishPublicStatusProjection =
+      validated.siteTitle !== undefined ||
+      validated.timezone !== undefined ||
+      validated.publicStatusWindowHours !== undefined ||
+      validated.publicStatusAggregationIntervalMinutes !== undefined;
+
+    let publicStatusProjectionWarningCode: string | null = null;
+    if (shouldRepublishPublicStatusProjection) {
+      try {
+        const publishResult = await publishCurrentPublicStatusConfigProjection({
+          reason: "save-system-settings",
+        });
+
+        if (!publishResult.written) {
+          logger.warn(
+            "[SystemSettings] Saved DB truth but failed to publish public-status Redis projection"
+          );
+          publicStatusProjectionWarningCode = "PUBLIC_STATUS_PROJECTION_PUBLISH_FAILED";
+        } else {
+          try {
+            await schedulePublicStatusRebuild({
+              intervalMinutes:
+                validated.publicStatusAggregationIntervalMinutes ??
+                updated.publicStatusAggregationIntervalMinutes,
+              rangeHours: validated.publicStatusWindowHours ?? updated.publicStatusWindowHours,
+              reason: "system-settings-updated",
+            });
+          } catch (error) {
+            logger.warn(
+              "[SystemSettings] Saved DB truth but failed to schedule public-status rebuild",
+              error
+            );
+            publicStatusProjectionWarningCode = "PUBLIC_STATUS_BACKGROUND_REFRESH_PENDING";
+          }
+        }
+      } catch (error) {
+        logger.warn(
+          "[SystemSettings] Saved DB truth but failed to publish public-status Redis projection",
+          error
+        );
+        publicStatusProjectionWarningCode = "PUBLIC_STATUS_PROJECTION_PUBLISH_FAILED";
+      }
+    }
+
+    // Revalidate paths for all locales to ensure cache invalidation across i18n routes
+    for (const locale of locales) {
+      revalidatePath(`/${locale}/settings/config`);
+      revalidatePath(`/${locale}/dashboard`);
+    }
+    revalidatePath("/", "layout");
+
+    emitActionAudit({
+      category: "system_settings",
+      action: "system_settings.update",
+      targetType: "system_settings",
+      targetId: String(updated.id),
+      targetName: "global",
+      before: before ?? undefined,
+      after: updated,
+      success: true,
+    });
+
+    return { ok: true, data: { ...updated, publicStatusProjectionWarningCode } };
+  } catch (error) {
+    logger.error("更新系统设置失败:", error);
+    const validationErrorCode = systemSettingsValidationErrorCode(error);
+    const message = validationErrorCode
+      ? validationErrorCode === REPLAY_CACHE_TTL_INVALID_ERROR_CODE
+        ? "Replay cache TTL validation failed."
+        : "Discovery settings validation failed."
+      : error instanceof Error
+        ? error.message
+        : "更新系统设置失败";
+    emitActionAudit({
+      category: "system_settings",
+      action: "system_settings.update",
+      targetType: "system_settings",
+      targetName: "global",
+      before: before ?? undefined,
+      success: false,
+      errorMessage: "UPDATE_FAILED",
+    });
+    return {
+      ok: false,
+      error: message,
+      ...(validationErrorCode ? { errorCode: validationErrorCode } : {}),
+    };
+  }
+}

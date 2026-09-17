@@ -1,0 +1,2552 @@
+"use server";
+
+import { and, asc, desc, eq, gt, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
+import { db, getMessageWriterDb } from "@/drizzle/db";
+import { keys as keysTable, messageRequest, providers, usageLedger, users } from "@/drizzle/schema";
+import { getEnvConfig } from "@/lib/config/env.schema";
+import { isLedgerOnlyMode } from "@/lib/ledger-fallback";
+import { logger } from "@/lib/logger";
+import {
+  getConfiguredPublicStatusGroupsForRollupResolution,
+  queuePublicStatusRollupWrite,
+} from "@/lib/public-status/rollup-store";
+import { formatCostForStorage } from "@/lib/utils/currency";
+import type { HedgeLoserBilling, StoredCostBreakdown } from "@/types/cost-breakdown";
+import type { CreateMessageRequestData, MessageRequest, ProviderChainItem } from "@/types/message";
+import { normalizeRoutingTrace, type RoutingTraceV1 } from "@/types/routing-trace";
+import type { SpecialSetting } from "@/types/special-settings";
+import { LEDGER_AUDIT_CONDITION, LEDGER_BILLING_CONDITION } from "./_shared/ledger-conditions";
+import { EXCLUDE_WARMUP_CONDITION } from "./_shared/message-request-conditions";
+import { toMessageRequest } from "./_shared/transformers";
+import { isReservedSessionIdentity } from "./_shared/usage-log-filters";
+import {
+  type DurableMessageRequestUpdateOptions,
+  enqueueMessageRequestPostTerminalRoutingTraceDurably,
+  enqueueMessageRequestUpdate,
+  enqueueMessageRequestUpdateDurably,
+  type MessageRequestUpdatePatch,
+} from "./message-write-buffer";
+import {
+  acknowledgeRoutingTraceOutbox,
+  persistRoutingTraceMonotonically,
+  stageRoutingTraceOutbox,
+} from "./routing-trace-outbox";
+
+const POST_TERMINAL_ROUTING_TRACE_ACK_TIMEOUT_MS = 3_000;
+const ledgerSessionIdentity = sql<string>`COALESCE(${usageLedger.sessionIdentity}, ${usageLedger.sessionId})`;
+const messageSessionIdentity = sql<string>`COALESCE(${messageRequest.sessionIdentity}, ${messageRequest.sessionId})`;
+
+function ledgerCanonicalSessionCondition(identity: string) {
+  return isReservedSessionIdentity(identity)
+    ? and(eq(ledgerSessionIdentity, identity), eq(usageLedger.sessionIdentity, identity))
+    : eq(ledgerSessionIdentity, identity);
+}
+
+function ledgerSessionLookupForOwner(identityOrPhysicalId: string, ownerUserId?: number) {
+  const reservedIdentity = isReservedSessionIdentity(identityOrPhysicalId);
+  const canonicalCondition = ledgerCanonicalSessionCondition(identityOrPhysicalId);
+  const lookupCondition = reservedIdentity
+    ? canonicalCondition
+    : or(canonicalCondition, eq(usageLedger.sessionId, identityOrPhysicalId));
+
+  return and(
+    lookupCondition,
+    ownerUserId !== undefined ? eq(usageLedger.userId, ownerUserId) : undefined
+  );
+}
+
+function ledgerCanonicalSessionLookup(identity: string, ownerUserId: number) {
+  return and(ledgerCanonicalSessionCondition(identity), eq(usageLedger.userId, ownerUserId));
+}
+
+function messageSessionLookup(identityOrPhysicalId: string, ownerUserId?: number) {
+  const canonicalCondition = isReservedSessionIdentity(identityOrPhysicalId)
+    ? eq(messageRequest.sessionIdentity, identityOrPhysicalId)
+    : eq(messageSessionIdentity, identityOrPhysicalId);
+  const lookupCondition =
+    ownerUserId !== undefined || !isReservedSessionIdentity(identityOrPhysicalId)
+      ? or(canonicalCondition, eq(messageRequest.sessionId, identityOrPhysicalId))
+      : canonicalCondition;
+
+  return and(
+    lookupCondition,
+    ownerUserId !== undefined ? eq(messageRequest.userId, ownerUserId) : undefined
+  );
+}
+
+function messageCanonicalSessionLookup(identity: string, ownerUserId?: number) {
+  const canonicalCondition = isReservedSessionIdentity(identity)
+    ? and(
+        // 保留 expression index 入口, 同时避免 reserved identity 混入同名物理 Session.
+        eq(messageSessionIdentity, identity),
+        ownerUserId !== undefined
+          ? or(eq(messageRequest.sessionIdentity, identity), isNull(messageRequest.sessionIdentity))
+          : eq(messageRequest.sessionIdentity, identity)
+      )
+    : eq(messageSessionIdentity, identity);
+
+  return and(
+    canonicalCondition,
+    ownerUserId !== undefined ? eq(messageRequest.userId, ownerUserId) : undefined
+  );
+}
+
+type PublicStatusRequestSeed = {
+  createdAt: Date;
+  model?: string | null;
+  originalModel?: string | null;
+  durationMs?: number | null;
+};
+
+type PublicStatusFinalDetails = {
+  durationMs?: number;
+  statusCode?: number;
+  outputTokens?: number;
+  ttftMs?: number | null;
+  firstByteMs?: number | null;
+  providerChain?: CreateMessageRequestData["provider_chain"];
+  errorMessage?: string;
+  model?: string;
+};
+
+const publicStatusRequestSeedCache = new Map<number, PublicStatusRequestSeed>();
+const PUBLIC_STATUS_REQUEST_SEED_CACHE_MAX_SIZE = 10_000;
+const publicStatusFinalizedRequestCache = new Map<number, true>();
+const PUBLIC_STATUS_FINALIZED_REQUEST_CACHE_MAX_SIZE = 10_000;
+const publicStatusInFlightRequestCache = new Set<number>();
+
+function rememberPublicStatusRequestSeed(id: number, seed: PublicStatusRequestSeed): void {
+  publicStatusRequestSeedCache.set(id, seed);
+  if (publicStatusRequestSeedCache.size <= PUBLIC_STATUS_REQUEST_SEED_CACHE_MAX_SIZE) {
+    return;
+  }
+
+  const firstKey = publicStatusRequestSeedCache.keys().next().value as number | undefined;
+  if (firstKey !== undefined) {
+    publicStatusRequestSeedCache.delete(firstKey);
+  }
+}
+
+function peekPublicStatusRequestSeed(id: number): PublicStatusRequestSeed | null {
+  return publicStatusRequestSeedCache.get(id) ?? null;
+}
+
+function consumePublicStatusRequestSeed(id: number): void {
+  publicStatusRequestSeedCache.delete(id);
+}
+
+function claimPublicStatusFinalization(id: number): boolean {
+  if (publicStatusFinalizedRequestCache.has(id)) {
+    return false;
+  }
+
+  publicStatusFinalizedRequestCache.set(id, true);
+  if (publicStatusFinalizedRequestCache.size <= PUBLIC_STATUS_FINALIZED_REQUEST_CACHE_MAX_SIZE) {
+    return true;
+  }
+
+  const firstKey = publicStatusFinalizedRequestCache.keys().next().value as number | undefined;
+  if (firstKey !== undefined) {
+    publicStatusFinalizedRequestCache.delete(firstKey);
+  }
+  return true;
+}
+
+function unclaimPublicStatusFinalization(id: number): void {
+  publicStatusFinalizedRequestCache.delete(id);
+}
+
+function markPublicStatusRequestInFlight(id: number): boolean {
+  if (publicStatusInFlightRequestCache.has(id)) {
+    return false;
+  }
+  publicStatusInFlightRequestCache.add(id);
+  return true;
+}
+
+function clearPublicStatusRequestInFlight(id: number): void {
+  publicStatusInFlightRequestCache.delete(id);
+}
+
+function updatePublicStatusRequestSeed(id: number, patch: Partial<PublicStatusRequestSeed>): void {
+  const seed = publicStatusRequestSeedCache.get(id);
+  if (!seed) {
+    return;
+  }
+  publicStatusRequestSeedCache.set(id, { ...seed, ...patch });
+}
+
+function isPublicStatusFinalDetails(details: PublicStatusFinalDetails): boolean {
+  return details.providerChain !== undefined && details.statusCode !== undefined;
+}
+
+async function readPublicStatusRequestSeedFallback(
+  id: number
+): Promise<PublicStatusRequestSeed | null> {
+  const [row] = await db
+    .select({
+      createdAt: messageRequest.createdAt,
+      model: messageRequest.model,
+      originalModel: messageRequest.originalModel,
+      durationMs: messageRequest.durationMs,
+    })
+    .from(messageRequest)
+    .where(
+      and(eq(messageRequest.id, id), isNull(messageRequest.deletedAt), EXCLUDE_WARMUP_CONDITION)
+    )
+    .limit(1);
+
+  if (!row?.createdAt) {
+    return null;
+  }
+
+  return {
+    createdAt: row.createdAt,
+    model: row.model,
+    originalModel: row.originalModel,
+    durationMs: row.durationMs,
+  };
+}
+
+function queuePublicStatusRollupForFinalDetails(
+  id: number,
+  details: PublicStatusFinalDetails
+): Promise<void> | undefined {
+  if (!isPublicStatusFinalDetails(details) || !markPublicStatusRequestInFlight(id)) {
+    return;
+  }
+  if (!claimPublicStatusFinalization(id)) {
+    clearPublicStatusRequestInFlight(id);
+    return;
+  }
+
+  return (async () => {
+    try {
+      const seed =
+        peekPublicStatusRequestSeed(id) ?? (await readPublicStatusRequestSeedFallback(id));
+      if (!seed) {
+        logger.warn("[MessageRequest] Missing public status rollup request seed", {
+          messageRequestId: id,
+        });
+        unclaimPublicStatusFinalization(id);
+        return;
+      }
+
+      const groupResolution = await getConfiguredPublicStatusGroupsForRollupResolution();
+      if (groupResolution.groups.length === 0) {
+        if (groupResolution.retryable) {
+          unclaimPublicStatusFinalization(id);
+        } else {
+          consumePublicStatusRequestSeed(id);
+        }
+        return;
+      }
+
+      const result = await queuePublicStatusRollupWrite({
+        groups: groupResolution.groups,
+        event: {
+          createdAt: seed.createdAt,
+          model: details.model ?? seed.model,
+          originalModel: seed.originalModel,
+          durationMs: seed.durationMs,
+          ttftMs: details.ttftMs,
+          firstByteMs: details.firstByteMs,
+          outputTokens: details.outputTokens,
+          providerChain: details.providerChain,
+        },
+      });
+      if (!result.written) {
+        if (result.retryable) {
+          unclaimPublicStatusFinalization(id);
+        } else {
+          consumePublicStatusRequestSeed(id);
+        }
+        return;
+      }
+      consumePublicStatusRequestSeed(id);
+    } catch (error) {
+      unclaimPublicStatusFinalization(id);
+      logger.warn("[MessageRequest] Failed to queue public status rollup", {
+        error: error instanceof Error ? error.message : String(error),
+        messageRequestId: id,
+      });
+    } finally {
+      clearPublicStatusRequestInFlight(id);
+    }
+  })();
+}
+
+function publishCommittedMessageRequestDetails(
+  id: number,
+  details: PublicStatusFinalDetails
+): Promise<void> | undefined {
+  if (details.durationMs !== undefined) {
+    updatePublicStatusRequestSeed(id, { durationMs: details.durationMs });
+  }
+  if (details.providerChain !== undefined && details.statusCode !== undefined) {
+    return queuePublicStatusRollupForFinalDetails(id, details);
+  }
+}
+
+/**
+ * 创建消息请求记录
+ */
+export async function createMessageRequest(
+  data: CreateMessageRequestData
+): Promise<MessageRequest> {
+  const formattedCost = formatCostForStorage(data.cost_usd);
+  const dbData = {
+    providerId: data.provider_id,
+    userId: data.user_id,
+    key: data.key,
+    model: data.model,
+    originalModel: data.original_model, // 原始模型（重定向前，用于计费和前端显示）
+    durationMs: data.duration_ms,
+    costUsd: formattedCost ?? undefined,
+    costMultiplier: data.cost_multiplier?.toString() ?? undefined, // 供应商倍率（转为字符串）
+    groupCostMultiplier: data.group_cost_multiplier?.toString() ?? undefined, // 分组倍率（转为字符串）
+    sessionId: data.session_id, // Session ID
+    sessionIdentity: data.session_identity,
+    sessionIdentityKind: data.session_identity_kind,
+    affinityScopeTag: data.affinity_scope_tag,
+    affinityFingerprint: data.affinity_fingerprint,
+    affinityFingerprintChain: data.affinity_fingerprint_chain,
+    isReplay: data.is_replay,
+    replaySourceRequestId: data.replay_source_request_id,
+    requestSequence: data.request_sequence, // Request Sequence（Session 内请求序号）
+    routingTrace:
+      data.routing_trace === undefined ? undefined : normalizeRoutingTrace(data.routing_trace),
+    userAgent: data.user_agent, // User-Agent
+    clientIp: data.client_ip, // 客户端 IP（IPv4/IPv6）
+    endpoint: data.endpoint, // 请求端点（可为空）
+    messagesCount: data.messages_count, // Messages 数量
+    specialSettings: data.special_settings ?? undefined, // 特殊设置（审计/展示）
+    cacheTtlApplied: data.cache_ttl_applied,
+    cacheCreationInputTokens: data.cache_creation_input_tokens,
+    cacheCreation5mInputTokens: data.cache_creation_5m_input_tokens,
+    cacheCreation1hInputTokens: data.cache_creation_1h_input_tokens,
+    cacheReadInputTokens: data.cache_read_input_tokens,
+  };
+
+  const [result] = await db.insert(messageRequest).values(dbData).returning({
+    id: messageRequest.id,
+    providerId: messageRequest.providerId,
+    userId: messageRequest.userId,
+    key: messageRequest.key,
+    model: messageRequest.model,
+    originalModel: messageRequest.originalModel, // 原始模型（重定向前）
+    durationMs: messageRequest.durationMs,
+    costUsd: messageRequest.costUsd,
+    costMultiplier: messageRequest.costMultiplier, // 新增
+    sessionId: messageRequest.sessionId, // 新增
+    sessionIdentity: messageRequest.sessionIdentity,
+    sessionIdentityKind: messageRequest.sessionIdentityKind,
+    affinityScopeTag: messageRequest.affinityScopeTag,
+    affinityFingerprint: messageRequest.affinityFingerprint,
+    affinityFingerprintChain: messageRequest.affinityFingerprintChain,
+    isReplay: messageRequest.isReplay,
+    replaySourceRequestId: messageRequest.replaySourceRequestId,
+    requestSequence: messageRequest.requestSequence, // Request Sequence
+    routingTrace: messageRequest.routingTrace,
+    userAgent: messageRequest.userAgent, // 新增
+    clientIp: messageRequest.clientIp, // 客户端 IP
+    endpoint: messageRequest.endpoint, // 新增：返回端点
+    messagesCount: messageRequest.messagesCount, // 新增
+    cacheTtlApplied: messageRequest.cacheTtlApplied,
+    cacheCreationInputTokens: messageRequest.cacheCreationInputTokens,
+    cacheCreation5mInputTokens: messageRequest.cacheCreation5mInputTokens,
+    cacheCreation1hInputTokens: messageRequest.cacheCreation1hInputTokens,
+    cacheReadInputTokens: messageRequest.cacheReadInputTokens,
+    specialSettings: messageRequest.specialSettings,
+    createdAt: messageRequest.createdAt,
+    updatedAt: messageRequest.updatedAt,
+    deletedAt: messageRequest.deletedAt,
+  });
+
+  rememberPublicStatusRequestSeed(result.id, {
+    createdAt: result.createdAt!,
+    model: result.model,
+    originalModel: result.originalModel,
+    durationMs: result.durationMs,
+  });
+
+  return toMessageRequest(result);
+}
+
+export async function materializeReplayAuditFromSource(
+  replayRequestId: number,
+  sourceRequestId: number
+): Promise<boolean> {
+  const rows = await db.execute(sql`
+    UPDATE message_request AS replay
+    SET
+      provider_id = source.provider_id,
+      model = source.model,
+      original_model = source.original_model,
+      actual_response_model = source.actual_response_model,
+      status_code = source.status_code,
+      input_tokens = source.input_tokens,
+      output_tokens = source.output_tokens,
+      cache_creation_input_tokens = source.cache_creation_input_tokens,
+      cache_read_input_tokens = source.cache_read_input_tokens,
+      cache_creation_5m_input_tokens = source.cache_creation_5m_input_tokens,
+      cache_creation_1h_input_tokens = source.cache_creation_1h_input_tokens,
+      cache_ttl_applied = source.cache_ttl_applied,
+      cost_multiplier = source.cost_multiplier,
+      group_cost_multiplier = source.group_cost_multiplier,
+      context_1m_applied = source.context_1m_applied,
+      swap_cache_ttl_applied = source.swap_cache_ttl_applied,
+      special_settings = source.special_settings,
+      replay_source_request_id = source.id,
+      is_replay = TRUE,
+      cost_usd = 0,
+      cost_breakdown = NULL,
+      blocked_by = NULL,
+      updated_at = NOW()
+    FROM message_request AS source
+    WHERE replay.id = ${replayRequestId}
+      AND replay.is_replay = TRUE
+      AND replay.deleted_at IS NULL
+      AND source.id = ${sourceRequestId}
+      AND source.id <> replay.id
+      AND source.is_replay = FALSE
+      AND source.deleted_at IS NULL
+      AND source.status_code >= 200
+      AND source.status_code < 400
+      AND COALESCE(source.error_message, '') = ''
+    RETURNING replay.id
+  `);
+
+  return rows.length > 0;
+}
+
+/**
+ * 更新消息请求的耗时
+ */
+export async function updateMessageRequestDuration(id: number, durationMs: number): Promise<void> {
+  updatePublicStatusRequestSeed(id, { durationMs });
+  if (getEnvConfig().MESSAGE_REQUEST_WRITE_MODE === "async") {
+    enqueueMessageRequestUpdate(id, { durationMs });
+    return;
+  }
+
+  await db
+    .update(messageRequest)
+    .set({
+      durationMs: durationMs,
+      updatedAt: new Date(),
+    })
+    .where(eq(messageRequest.id, id));
+}
+
+/**
+ * 更新消息请求的费用
+ */
+export async function updateMessageRequestCost(
+  id: number,
+  costUsd: CreateMessageRequestData["cost_usd"]
+): Promise<void> {
+  const formattedCost = formatCostForStorage(costUsd);
+  if (!formattedCost) {
+    return;
+  }
+
+  if (getEnvConfig().MESSAGE_REQUEST_WRITE_MODE === "async") {
+    enqueueMessageRequestUpdate(id, { costUsd: formattedCost });
+    return;
+  }
+
+  await db
+    .update(messageRequest)
+    .set({
+      costUsd: formattedCost,
+      updatedAt: new Date(),
+    })
+    .where(eq(messageRequest.id, id));
+}
+
+/**
+ * Update cost with optional breakdown for billing detail display.
+ */
+export async function updateMessageRequestCostWithBreakdown(
+  id: number,
+  costUsd: CreateMessageRequestData["cost_usd"],
+  costBreakdown?: StoredCostBreakdown
+): Promise<void> {
+  const formattedCost = formatCostForStorage(costUsd);
+  if (!formattedCost) {
+    return;
+  }
+
+  if (getEnvConfig().MESSAGE_REQUEST_WRITE_MODE === "async") {
+    enqueueMessageRequestUpdate(id, {
+      costUsd: formattedCost,
+      ...(costBreakdown ? { costBreakdown } : {}),
+    });
+    return;
+  }
+
+  await db
+    .update(messageRequest)
+    .set({
+      costUsd: formattedCost,
+      ...(costBreakdown ? { costBreakdown } : {}),
+      updatedAt: new Date(),
+    })
+    .where(eq(messageRequest.id, id));
+}
+
+/**
+ * Write a hedge (provider racing) WINNER's cost in a way that coexists with the
+ * losers' independent additive writes WITHOUT a non-idempotent additive delta.
+ *
+ * cost_usd is set to `winnerCost + SUM(hedge_losers[].costUsd)` — i.e. the winner
+ * cost plus whatever losers have ALREADY landed in the jsonb array. Losers that
+ * land later still add themselves via addMessageRequestHedgeLoserCost's additive
+ * write, so the grand total is correct regardless of ordering:
+ *   - loser before winner: included in the winner's SUM (its own += is overwritten)
+ *   - loser after winner:  added by its own += on top of the winner base
+ * This is a REPLACEMENT (recomputed from the authoritative hedge_losers array), so
+ * it is idempotent under retry / ambiguous DB failure — unlike a bare additive delta.
+ * It is written directly (not via the async buffer) so it can never be dropped on
+ * queue overflow and never re-summed on flush-retry.
+ */
+export async function updateMessageRequestWinnerCost(
+  id: number,
+  winnerCost: CreateMessageRequestData["cost_usd"],
+  costBreakdown?: StoredCostBreakdown
+): Promise<void> {
+  const formattedCost = formatCostForStorage(winnerCost);
+  if (!formattedCost) {
+    return;
+  }
+
+  const MAX_ATTEMPTS = 3;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      await db
+        .update(messageRequest)
+        .set({
+          costUsd: sql`${formattedCost}::numeric + COALESCE((SELECT SUM((entry->>'costUsd')::numeric) FROM jsonb_array_elements(COALESCE(${messageRequest.hedgeLosers}, '[]'::jsonb)) AS entry), 0)`,
+          ...(costBreakdown ? { costBreakdown } : {}),
+          updatedAt: new Date(),
+        })
+        .where(eq(messageRequest.id, id));
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < MAX_ATTEMPTS - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Accumulate a hedge (provider racing) loser's billed cost onto an existing
+ * request row, and append the loser's billing detail to the hedge_losers array.
+ *
+ * Both writes happen in ONE atomic, IDEMPOTENT statement:
+ * - cost_usd     += deltaCost
+ * - hedge_losers ||= [loserEntry]
+ * guarded by `NOT (hedge_losers @> [{providerId, attemptNumber}])` so the same
+ * loser is never billed twice — even if this write is retried after an ambiguous
+ * DB failure (statement applied but the client saw an error).
+ *
+ * This deliberately bypasses the async write buffer and writes directly, so a
+ * loser's cost can never be silently dropped during graceful shutdown (when the
+ * buffer stops accepting enqueues) and is retried on transient DB errors. The
+ * loser response is gone after the request, so its cost is irrecoverable if lost
+ * — exactly-once durability matters more than batching for this low-frequency path.
+ *
+ * cost_usd is additive and commutative, so this composes correctly with the
+ * winner's additive write and with other losers writing concurrently to the row.
+ */
+export async function addMessageRequestHedgeLoserCost(
+  id: number,
+  deltaCost: CreateMessageRequestData["cost_usd"],
+  loserEntry: HedgeLoserBilling
+): Promise<void> {
+  const formattedDelta = formatCostForStorage(deltaCost);
+  if (!formattedDelta) {
+    return;
+  }
+
+  const loserJson = JSON.stringify([loserEntry]);
+  // Partial-match dedup key: jsonb @> matches array elements containing these fields.
+  const guardJson = JSON.stringify([
+    { providerId: loserEntry.providerId, attemptNumber: loserEntry.attemptNumber },
+  ]);
+
+  const MAX_ATTEMPTS = 3;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      await db
+        .update(messageRequest)
+        .set({
+          costUsd: sql`COALESCE(${messageRequest.costUsd}, 0) + ${formattedDelta}::numeric`,
+          hedgeLosers: sql`COALESCE(${messageRequest.hedgeLosers}, '[]'::jsonb) || ${loserJson}::jsonb`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(messageRequest.id, id),
+            sql`NOT (COALESCE(${messageRequest.hedgeLosers}, '[]'::jsonb) @> ${guardJson}::jsonb)`
+          )
+        );
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < MAX_ATTEMPTS - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+      }
+    }
+  }
+  // Exhausted retries: surface to the caller (finalizeHedgeLoserBilling logs and swallows).
+  throw lastError;
+}
+
+export type MessageRequestDetailsUpdate = {
+  durationMs?: number;
+  statusCode?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  ttftMs?: number | null;
+  firstByteMs?: number | null;
+  cacheCreationInputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreation5mInputTokens?: number;
+  cacheCreation1hInputTokens?: number;
+  cacheTtlApplied?: string | null;
+  providerChain?: CreateMessageRequestData["provider_chain"];
+  routingTrace?: RoutingTraceV1 | null;
+  errorMessage?: string;
+  errorStack?: string; // 完整堆栈信息
+  errorCause?: string; // 嵌套错误原因（JSON 格式）
+  model?: string; // ⭐ 新增：支持更新重定向后的模型名称
+  actualResponseModel?: string | null; // 上游响应实际返回的模型名(audit 用途，不影响计费)
+  providerId?: number; // ⭐ 新增：支持更新最终供应商ID（重试切换后）
+  context1mApplied?: boolean; // 是否应用了1M上下文窗口
+  swapCacheTtlApplied?: boolean; // Swap Cache TTL Billing active at request time
+  specialSettings?: CreateMessageRequestData["special_settings"]; // 特殊设置（审计/展示）
+  // F3b 缓存效果计费模拟（可空列，仅指标聚合使用）
+  cacheCompatibilityKey?: string | null;
+  cacheScoreEligible?: boolean | null;
+  cacheScoreExcludedReason?: string | null;
+  theoreticalCacheTokens?: number | null;
+  cacheTtlBucket?: string | null;
+};
+
+/**
+ * 更新消息请求的扩展信息（status code, tokens, provider chain, error）
+ */
+export async function updateMessageRequestDetails(
+  id: number,
+  details: MessageRequestDetailsUpdate,
+  options: { onlyIfUnfinalized?: boolean; awaitCommitObservers?: boolean } = {}
+): Promise<boolean> {
+  if (getEnvConfig().MESSAGE_REQUEST_WRITE_MODE === "async" && !options.onlyIfUnfinalized) {
+    // 终态 patch 必须观察 SQL commit 后再发布 public-status rollup。
+    // 非终态 metadata 仍保持轻量 enqueue，但不能伪称已提交。
+    if (details.statusCode !== undefined) {
+      await updateMessageRequestDetailsDurably(id, details);
+      return true;
+    }
+    enqueueMessageRequestUpdate(id, details);
+    return true;
+  }
+
+  const updateData: Record<string, unknown> = {
+    updatedAt: new Date(),
+  };
+
+  if (details.durationMs !== undefined) {
+    updateData.durationMs = details.durationMs;
+  }
+  if (details.statusCode !== undefined) {
+    updateData.statusCode = details.statusCode;
+  }
+  if (details.inputTokens !== undefined) {
+    updateData.inputTokens = details.inputTokens;
+  }
+  if (details.outputTokens !== undefined) {
+    updateData.outputTokens = details.outputTokens;
+  }
+  if (details.ttftMs !== undefined) {
+    updateData.ttftMs = details.ttftMs;
+  }
+  if (details.firstByteMs !== undefined) {
+    updateData.firstByteMs = details.firstByteMs;
+  }
+  if (details.cacheCreationInputTokens !== undefined) {
+    updateData.cacheCreationInputTokens = details.cacheCreationInputTokens;
+  }
+  if (details.cacheReadInputTokens !== undefined) {
+    updateData.cacheReadInputTokens = details.cacheReadInputTokens;
+  }
+  if (details.cacheCreation5mInputTokens !== undefined) {
+    updateData.cacheCreation5mInputTokens = details.cacheCreation5mInputTokens;
+  }
+  if (details.cacheCreation1hInputTokens !== undefined) {
+    updateData.cacheCreation1hInputTokens = details.cacheCreation1hInputTokens;
+  }
+  if (details.cacheTtlApplied !== undefined) {
+    updateData.cacheTtlApplied = details.cacheTtlApplied;
+  }
+  if (details.providerChain !== undefined) {
+    updateData.providerChain = details.providerChain;
+  }
+  if (details.routingTrace !== undefined) {
+    updateData.routingTrace = normalizeRoutingTrace(details.routingTrace);
+  }
+  if (details.errorMessage !== undefined) {
+    updateData.errorMessage = details.errorMessage;
+  }
+  if (details.errorStack !== undefined) {
+    updateData.errorStack = details.errorStack;
+  }
+  if (details.errorCause !== undefined) {
+    updateData.errorCause = details.errorCause;
+  }
+  if (details.model !== undefined) {
+    updateData.model = details.model;
+  }
+  if (details.actualResponseModel !== undefined) {
+    updateData.actualResponseModel = details.actualResponseModel;
+  }
+  if (details.providerId !== undefined) {
+    updateData.providerId = details.providerId;
+  }
+  if (details.context1mApplied !== undefined) {
+    updateData.context1mApplied = details.context1mApplied;
+  }
+  if (details.swapCacheTtlApplied !== undefined) {
+    updateData.swapCacheTtlApplied = details.swapCacheTtlApplied;
+  }
+  if (details.specialSettings !== undefined) {
+    updateData.specialSettings = details.specialSettings;
+  }
+  if (details.cacheCompatibilityKey !== undefined) {
+    updateData.cacheCompatibilityKey = details.cacheCompatibilityKey;
+  }
+  if (details.cacheScoreEligible !== undefined) {
+    updateData.cacheScoreEligible = details.cacheScoreEligible;
+  }
+  if (details.cacheScoreExcludedReason !== undefined) {
+    updateData.cacheScoreExcludedReason = details.cacheScoreExcludedReason;
+  }
+  if (details.theoreticalCacheTokens !== undefined) {
+    updateData.theoreticalCacheTokens = details.theoreticalCacheTokens;
+  }
+  if (details.cacheTtlBucket !== undefined) {
+    updateData.cacheTtlBucket = details.cacheTtlBucket;
+  }
+
+  if (options.onlyIfUnfinalized) {
+    const terminalDb =
+      getEnvConfig().MESSAGE_REQUEST_WRITE_MODE === "async" ? getMessageWriterDb() : db;
+    const updated = await terminalDb
+      .update(messageRequest)
+      .set(updateData)
+      .where(and(eq(messageRequest.id, id), isNull(messageRequest.statusCode)))
+      .returning({ id: messageRequest.id });
+    if (updated.length === 0) {
+      return false;
+    }
+  } else {
+    await db.update(messageRequest).set(updateData).where(eq(messageRequest.id, id));
+  }
+  const rollupPromise = publishCommittedMessageRequestDetails(id, details);
+  if (options.awaitCommitObservers === false) {
+    void rollupPromise;
+  } else {
+    await rollupPromise;
+  }
+  return true;
+}
+
+/**
+ * Routing trace patch for work that completes after the request's terminal row
+ * has committed. A Redis outbox is staged first so a shutdown-time database
+ * outage can be replayed after restart without touching terminal ownership,
+ * billing, or public-status rollups.
+ */
+export async function updateMessageRequestRoutingTrace(
+  id: number,
+  routingTrace: RoutingTraceV1
+): Promise<void> {
+  const normalized = normalizeRoutingTrace(routingTrace);
+  if (!normalized) {
+    logger.warn("[MessageRequest] Skipped patching invalid routing trace", {
+      requestId: id,
+    });
+    return;
+  }
+
+  const outboxReceipt = await stageRoutingTraceOutbox(id, normalized);
+  let persisted = false;
+
+  if (getEnvConfig().MESSAGE_REQUEST_WRITE_MODE === "async") {
+    let persistenceError: unknown = null;
+    try {
+      persisted = await enqueueMessageRequestPostTerminalRoutingTraceDurably(id, normalized, {
+        timeoutMs: POST_TERMINAL_ROUTING_TRACE_ACK_TIMEOUT_MS,
+      });
+    } catch (error) {
+      persistenceError = error;
+    }
+
+    // A different revision may be coalesced behind an older in-flight writer
+    // task. Normally its outbox receipt is the recovery path; if Redis staging
+    // was unavailable, make one monotonic direct attempt instead of dropping it.
+    if (!persisted && !outboxReceipt) {
+      try {
+        await persistRoutingTraceMonotonically(id, normalized);
+        persisted = true;
+        persistenceError = null;
+      } catch (error) {
+        persistenceError = error;
+      }
+    }
+
+    if (!persisted && persistenceError) {
+      logger.warn("[MessageRequest] Failed to patch finalized routing trace", {
+        requestId: id,
+        recoverable: outboxReceipt !== null,
+        error:
+          persistenceError instanceof Error ? persistenceError.message : String(persistenceError),
+      });
+    }
+    if (persisted && outboxReceipt) {
+      await acknowledgeRoutingTraceOutbox(outboxReceipt);
+    }
+    return;
+  }
+
+  try {
+    await persistRoutingTraceMonotonically(id, normalized);
+    persisted = true;
+  } catch (error) {
+    logger.warn("[MessageRequest] Failed to patch finalized routing trace", {
+      requestId: id,
+      recoverable: outboxReceipt !== null,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  if (persisted && outboxReceipt) {
+    await acknowledgeRoutingTraceOutbox(outboxReceipt);
+  }
+}
+
+export async function updateMessageRequestDetailsIfUnfinalized(
+  id: number,
+  details: MessageRequestDetailsUpdate,
+  options?: Pick<DurableMessageRequestUpdateOptions, "onCommitted">
+): Promise<boolean> {
+  const committed = await updateMessageRequestDetails(id, details, {
+    onlyIfUnfinalized: true,
+    awaitCommitObservers: false,
+  });
+  if (committed && options?.onCommitted) {
+    try {
+      const callbackResult = options.onCommitted(details);
+      if (callbackResult && typeof callbackResult.then === "function") {
+        void Promise.resolve(callbackResult).catch((error) => {
+          logger.warn("[MessageRequest] Conditional commit callback failed", {
+            messageRequestId: id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
+    } catch (error) {
+      logger.warn("[MessageRequest] Conditional commit callback failed", {
+        messageRequestId: id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return committed;
+}
+
+/**
+ * Persist terminal request details with an acknowledgement that the backing SQL batch committed.
+ * Ordinary async metadata updates continue to use updateMessageRequestDetails().
+ */
+export async function updateMessageRequestDetailsDurably(
+  id: number,
+  details: MessageRequestDetailsUpdate,
+  options?: DurableMessageRequestUpdateOptions
+): Promise<boolean> {
+  if (getEnvConfig().MESSAGE_REQUEST_WRITE_MODE !== "async") {
+    const committed = await updateMessageRequestDetails(id, details, {
+      onlyIfUnfinalized: true,
+      awaitCommitObservers: false,
+    });
+    if (committed) {
+      try {
+        const callbackResult = options?.onCommitted?.(details);
+        if (callbackResult && typeof callbackResult.then === "function") {
+          void Promise.resolve(callbackResult).catch((error) => {
+            logger.warn("[MessageRequest] onCommitted callback failed", {
+              messageRequestId: id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }
+      } catch (error) {
+        logger.warn("[MessageRequest] onCommitted callback failed", {
+          messageRequestId: id,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    return committed;
+  }
+
+  let commitPublished = false;
+  const publishCommit = (committedPatch: Readonly<MessageRequestUpdatePatch>) => {
+    if (commitPublished) return;
+    commitPublished = true;
+    const rollupPromise = publishCommittedMessageRequestDetails(id, committedPatch);
+    const callbackResult = options?.onCommitted?.(committedPatch);
+    if (rollupPromise && callbackResult) {
+      return Promise.all([rollupPromise, callbackResult]).then(() => undefined);
+    }
+    return callbackResult ?? rollupPromise;
+  };
+
+  const committed = await enqueueMessageRequestUpdateDurably(id, details, {
+    ...options,
+    onCommitted: publishCommit,
+  });
+  return committed;
+}
+
+/**
+ * 根据用户ID查询消息请求记录（分页）
+ */
+export async function findLatestMessageRequestByKey(key: string): Promise<MessageRequest | null> {
+  const [result] = await db
+    .select({
+      id: messageRequest.id,
+      providerId: messageRequest.providerId,
+      userId: messageRequest.userId,
+      key: messageRequest.key,
+      durationMs: messageRequest.durationMs,
+      costUsd: messageRequest.costUsd,
+      createdAt: messageRequest.createdAt,
+      updatedAt: messageRequest.updatedAt,
+      deletedAt: messageRequest.deletedAt,
+    })
+    .from(messageRequest)
+    .where(and(eq(messageRequest.key, key), isNull(messageRequest.deletedAt)))
+    .orderBy(desc(messageRequest.createdAt))
+    .limit(1);
+
+  if (!result) return null;
+  return toMessageRequest(result);
+}
+
+export async function findMessageRequestById(id: number): Promise<MessageRequest | null> {
+  const [result] = await db
+    .select({
+      id: messageRequest.id,
+      providerId: messageRequest.providerId,
+      userId: messageRequest.userId,
+      key: messageRequest.key,
+      model: messageRequest.model,
+      originalModel: messageRequest.originalModel,
+      durationMs: messageRequest.durationMs,
+      ttftMs: messageRequest.ttftMs,
+      firstByteMs: messageRequest.firstByteMs,
+      costUsd: messageRequest.costUsd,
+      costMultiplier: messageRequest.costMultiplier,
+      sessionId: messageRequest.sessionId,
+      userAgent: messageRequest.userAgent,
+      clientIp: messageRequest.clientIp,
+      endpoint: messageRequest.endpoint,
+      messagesCount: messageRequest.messagesCount,
+      statusCode: messageRequest.statusCode,
+      inputTokens: messageRequest.inputTokens,
+      outputTokens: messageRequest.outputTokens,
+      cacheCreationInputTokens: messageRequest.cacheCreationInputTokens,
+      cacheReadInputTokens: messageRequest.cacheReadInputTokens,
+      cacheCreation5mInputTokens: messageRequest.cacheCreation5mInputTokens,
+      cacheCreation1hInputTokens: messageRequest.cacheCreation1hInputTokens,
+      cacheTtlApplied: messageRequest.cacheTtlApplied,
+      errorMessage: messageRequest.errorMessage,
+      providerChain: messageRequest.providerChain,
+      routingTrace: messageRequest.routingTrace,
+      blockedBy: messageRequest.blockedBy,
+      blockedReason: messageRequest.blockedReason,
+      context1mApplied: messageRequest.context1mApplied,
+      swapCacheTtlApplied: messageRequest.swapCacheTtlApplied,
+      specialSettings: messageRequest.specialSettings,
+      isReplay: messageRequest.isReplay,
+      replaySourceRequestId: messageRequest.replaySourceRequestId,
+      createdAt: messageRequest.createdAt,
+      updatedAt: messageRequest.updatedAt,
+      deletedAt: messageRequest.deletedAt,
+    })
+    .from(messageRequest)
+    .where(and(eq(messageRequest.id, id), isNull(messageRequest.deletedAt)))
+    .limit(1);
+
+  if (result) {
+    return toMessageRequest(result);
+  }
+
+  if (!(await isLedgerOnlyMode())) {
+    return null;
+  }
+
+  const [ledgerRow] = await db
+    .select({
+      requestId: usageLedger.requestId,
+      finalProviderId: usageLedger.finalProviderId,
+      userId: usageLedger.userId,
+      key: usageLedger.key,
+      model: usageLedger.model,
+      originalModel: usageLedger.originalModel,
+      endpoint: usageLedger.endpoint,
+      statusCode: usageLedger.statusCode,
+      costUsd: usageLedger.costUsd,
+      costMultiplier: usageLedger.costMultiplier,
+      inputTokens: usageLedger.inputTokens,
+      outputTokens: usageLedger.outputTokens,
+      cacheCreationInputTokens: usageLedger.cacheCreationInputTokens,
+      cacheReadInputTokens: usageLedger.cacheReadInputTokens,
+      cacheCreation5mInputTokens: usageLedger.cacheCreation5mInputTokens,
+      cacheCreation1hInputTokens: usageLedger.cacheCreation1hInputTokens,
+      cacheTtlApplied: usageLedger.cacheTtlApplied,
+      context1mApplied: usageLedger.context1mApplied,
+      swapCacheTtlApplied: usageLedger.swapCacheTtlApplied,
+      durationMs: usageLedger.durationMs,
+      ttftMs: usageLedger.ttftMs,
+      firstByteMs: usageLedger.firstByteMs,
+      sessionId: usageLedger.sessionId,
+      isReplay: usageLedger.isReplay,
+      replaySourceRequestId: usageLedger.replaySourceRequestId,
+      createdAt: usageLedger.createdAt,
+    })
+    .from(usageLedger)
+    .where(and(eq(usageLedger.requestId, id), LEDGER_AUDIT_CONDITION))
+    .limit(1);
+
+  if (!ledgerRow) {
+    return null;
+  }
+
+  return toMessageRequest({
+    id: ledgerRow.requestId,
+    providerId: ledgerRow.finalProviderId,
+    userId: ledgerRow.userId,
+    key: ledgerRow.key,
+    model: ledgerRow.model,
+    originalModel: ledgerRow.originalModel,
+    durationMs: ledgerRow.durationMs,
+    ttftMs: ledgerRow.ttftMs,
+    firstByteMs: ledgerRow.firstByteMs,
+    costUsd: ledgerRow.costUsd,
+    costMultiplier: ledgerRow.costMultiplier,
+    sessionId: ledgerRow.sessionId,
+    isReplay: ledgerRow.isReplay,
+    replaySourceRequestId: ledgerRow.replaySourceRequestId,
+    userAgent: null,
+    endpoint: ledgerRow.endpoint,
+    messagesCount: null,
+    statusCode: ledgerRow.statusCode,
+    inputTokens: ledgerRow.inputTokens,
+    outputTokens: ledgerRow.outputTokens,
+    cacheCreationInputTokens: ledgerRow.cacheCreationInputTokens,
+    cacheReadInputTokens: ledgerRow.cacheReadInputTokens,
+    cacheCreation5mInputTokens: ledgerRow.cacheCreation5mInputTokens,
+    cacheCreation1hInputTokens: ledgerRow.cacheCreation1hInputTokens,
+    cacheTtlApplied: ledgerRow.cacheTtlApplied,
+    errorMessage: null,
+    providerChain: null,
+    routingTrace: null,
+    blockedBy: null,
+    blockedReason: null,
+    context1mApplied: ledgerRow.context1mApplied,
+    swapCacheTtlApplied: ledgerRow.swapCacheTtlApplied,
+    specialSettings: null,
+    createdAt: ledgerRow.createdAt,
+    updatedAt: ledgerRow.createdAt,
+    deletedAt: null,
+  });
+}
+
+/**
+ * 根据 session ID 查询消息请求记录（用于获取完整元数据）
+ * 返回该 session 的最后一条记录（最新的）
+ */
+export async function findMessageRequestBySessionId(
+  sessionId: string
+): Promise<MessageRequest | null> {
+  const [result] = await db
+    .select({
+      id: messageRequest.id,
+      providerId: messageRequest.providerId,
+      userId: messageRequest.userId,
+      key: messageRequest.key,
+      model: messageRequest.model,
+      originalModel: messageRequest.originalModel,
+      durationMs: messageRequest.durationMs,
+      costUsd: messageRequest.costUsd,
+      costMultiplier: messageRequest.costMultiplier,
+      sessionId: messageRequest.sessionId,
+      userAgent: messageRequest.userAgent,
+      clientIp: messageRequest.clientIp,
+      messagesCount: messageRequest.messagesCount,
+      statusCode: messageRequest.statusCode,
+      inputTokens: messageRequest.inputTokens,
+      outputTokens: messageRequest.outputTokens,
+      cacheCreationInputTokens: messageRequest.cacheCreationInputTokens,
+      cacheReadInputTokens: messageRequest.cacheReadInputTokens,
+      cacheCreation5mInputTokens: messageRequest.cacheCreation5mInputTokens,
+      cacheCreation1hInputTokens: messageRequest.cacheCreation1hInputTokens,
+      cacheTtlApplied: messageRequest.cacheTtlApplied,
+      errorMessage: messageRequest.errorMessage,
+      providerChain: messageRequest.providerChain,
+      routingTrace: messageRequest.routingTrace,
+      blockedBy: messageRequest.blockedBy,
+      blockedReason: messageRequest.blockedReason,
+      isReplay: messageRequest.isReplay,
+      replaySourceRequestId: messageRequest.replaySourceRequestId,
+      createdAt: messageRequest.createdAt,
+      updatedAt: messageRequest.updatedAt,
+      deletedAt: messageRequest.deletedAt,
+    })
+    .from(messageRequest)
+    .where(and(eq(messageRequest.sessionId, sessionId), isNull(messageRequest.deletedAt)))
+    .orderBy(desc(messageRequest.createdAt))
+    .limit(1);
+
+  if (result) {
+    return toMessageRequest(result);
+  }
+
+  if (!(await isLedgerOnlyMode())) {
+    return null;
+  }
+
+  const [ledgerRow] = await db
+    .select({
+      requestId: usageLedger.requestId,
+      finalProviderId: usageLedger.finalProviderId,
+      userId: usageLedger.userId,
+      key: usageLedger.key,
+      model: usageLedger.model,
+      originalModel: usageLedger.originalModel,
+      endpoint: usageLedger.endpoint,
+      statusCode: usageLedger.statusCode,
+      costUsd: usageLedger.costUsd,
+      costMultiplier: usageLedger.costMultiplier,
+      inputTokens: usageLedger.inputTokens,
+      outputTokens: usageLedger.outputTokens,
+      cacheCreationInputTokens: usageLedger.cacheCreationInputTokens,
+      cacheReadInputTokens: usageLedger.cacheReadInputTokens,
+      cacheCreation5mInputTokens: usageLedger.cacheCreation5mInputTokens,
+      cacheCreation1hInputTokens: usageLedger.cacheCreation1hInputTokens,
+      cacheTtlApplied: usageLedger.cacheTtlApplied,
+      context1mApplied: usageLedger.context1mApplied,
+      swapCacheTtlApplied: usageLedger.swapCacheTtlApplied,
+      durationMs: usageLedger.durationMs,
+      ttftMs: usageLedger.ttftMs,
+      firstByteMs: usageLedger.firstByteMs,
+      sessionId: usageLedger.sessionId,
+      isReplay: usageLedger.isReplay,
+      replaySourceRequestId: usageLedger.replaySourceRequestId,
+      createdAt: usageLedger.createdAt,
+    })
+    .from(usageLedger)
+    .where(and(eq(usageLedger.sessionId, sessionId), LEDGER_AUDIT_CONDITION))
+    .orderBy(desc(usageLedger.createdAt), desc(usageLedger.requestId))
+    .limit(1);
+
+  if (!ledgerRow) {
+    return null;
+  }
+
+  return toMessageRequest({
+    id: ledgerRow.requestId,
+    providerId: ledgerRow.finalProviderId,
+    userId: ledgerRow.userId,
+    key: ledgerRow.key,
+    model: ledgerRow.model,
+    originalModel: ledgerRow.originalModel,
+    durationMs: ledgerRow.durationMs,
+    ttftMs: ledgerRow.ttftMs,
+    firstByteMs: ledgerRow.firstByteMs,
+    costUsd: ledgerRow.costUsd,
+    costMultiplier: ledgerRow.costMultiplier,
+    sessionId: ledgerRow.sessionId,
+    isReplay: ledgerRow.isReplay,
+    replaySourceRequestId: ledgerRow.replaySourceRequestId,
+    userAgent: null,
+    endpoint: ledgerRow.endpoint,
+    messagesCount: null,
+    statusCode: ledgerRow.statusCode,
+    inputTokens: ledgerRow.inputTokens,
+    outputTokens: ledgerRow.outputTokens,
+    cacheCreationInputTokens: ledgerRow.cacheCreationInputTokens,
+    cacheReadInputTokens: ledgerRow.cacheReadInputTokens,
+    cacheCreation5mInputTokens: ledgerRow.cacheCreation5mInputTokens,
+    cacheCreation1hInputTokens: ledgerRow.cacheCreation1hInputTokens,
+    cacheTtlApplied: ledgerRow.cacheTtlApplied,
+    errorMessage: null,
+    providerChain: null,
+    routingTrace: null,
+    blockedBy: null,
+    blockedReason: null,
+    context1mApplied: ledgerRow.context1mApplied,
+    swapCacheTtlApplied: ledgerRow.swapCacheTtlApplied,
+    specialSettings: null,
+    createdAt: ledgerRow.createdAt,
+    updatedAt: ledgerRow.createdAt,
+    deletedAt: null,
+  });
+}
+
+/**
+ * 查询选中请求所属 key epoch 内最近且不晚于该请求的初始 providerChain。
+ */
+export async function findSessionOriginChain(
+  requestId: number,
+  keyId: number,
+  ownerUserId: number
+): Promise<ProviderChainItem[] | null> {
+  const selectedRequest = alias(messageRequest, "selected_message_request");
+  const requestBoundary = or(
+    and(
+      isNotNull(selectedRequest.createdAt),
+      or(
+        lt(messageRequest.createdAt, selectedRequest.createdAt),
+        and(
+          eq(messageRequest.createdAt, selectedRequest.createdAt),
+          lte(messageRequest.id, selectedRequest.id)
+        )
+      )
+    ),
+    and(isNull(selectedRequest.createdAt), lte(messageRequest.id, selectedRequest.id))
+  );
+
+  const [row] = await db
+    .select({
+      providerChain: messageRequest.providerChain,
+    })
+    .from(messageRequest)
+    .innerJoin(keysTable, eq(messageRequest.key, keysTable.key))
+    .innerJoin(
+      selectedRequest,
+      and(
+        eq(selectedRequest.id, requestId),
+        eq(selectedRequest.key, keysTable.key),
+        eq(selectedRequest.userId, ownerUserId),
+        isNotNull(selectedRequest.sessionId),
+        isNull(selectedRequest.deletedAt),
+        eq(messageRequest.sessionId, selectedRequest.sessionId),
+        eq(messageRequest.userId, selectedRequest.userId),
+        requestBoundary
+      )
+    )
+    .where(
+      and(
+        eq(keysTable.id, keyId),
+        eq(messageRequest.userId, ownerUserId),
+        isNull(messageRequest.deletedAt),
+        EXCLUDE_WARMUP_CONDITION,
+        sql`${messageRequest.providerChain} IS NOT NULL`,
+        sql`${messageRequest.providerChain} @> '[{"reason": "initial_selection"}]'::jsonb`
+      )
+    )
+    .orderBy(
+      sql`CASE WHEN ${selectedRequest.createdAt} IS NULL THEN ${messageRequest.id} END DESC`,
+      desc(messageRequest.createdAt),
+      desc(messageRequest.id)
+    )
+    .limit(1);
+
+  if (!row?.providerChain) return null;
+  return row.providerChain as ProviderChainItem[];
+}
+
+/**
+ * 按 (sessionId, requestSequence) 获取请求的审计字段（用于 Session 详情页补齐特殊设置展示）
+ */
+export async function findMessageRequestAuditById(
+  requestId: number,
+  ownerUserId?: number
+): Promise<{
+  statusCode: number | null;
+  blockedBy: string | null;
+  blockedReason: string | null;
+  cacheTtlApplied: string | null;
+  context1mApplied: boolean | null;
+  swapCacheTtlApplied: boolean | null;
+  specialSettings: SpecialSetting[] | null;
+} | null> {
+  const [row] = await db
+    .select({
+      statusCode: messageRequest.statusCode,
+      blockedBy: messageRequest.blockedBy,
+      blockedReason: messageRequest.blockedReason,
+      cacheTtlApplied: messageRequest.cacheTtlApplied,
+      context1mApplied: messageRequest.context1mApplied,
+      swapCacheTtlApplied: messageRequest.swapCacheTtlApplied,
+      specialSettings: messageRequest.specialSettings,
+    })
+    .from(messageRequest)
+    .where(
+      and(
+        eq(messageRequest.id, requestId),
+        ownerUserId !== undefined ? eq(messageRequest.userId, ownerUserId) : undefined,
+        isNull(messageRequest.deletedAt)
+      )
+    )
+    .limit(1);
+
+  if (!row) return null;
+  return {
+    statusCode: row.statusCode,
+    blockedBy: row.blockedBy,
+    blockedReason: row.blockedReason,
+    cacheTtlApplied: row.cacheTtlApplied,
+    context1mApplied: row.context1mApplied,
+    swapCacheTtlApplied: row.swapCacheTtlApplied,
+    specialSettings: Array.isArray(row.specialSettings)
+      ? (row.specialSettings as SpecialSetting[])
+      : null,
+  };
+}
+
+/**
+ * 聚合查询指定 session 的所有请求数据
+ * 返回总成本、总 Token、请求次数、供应商列表等
+ *
+ * @param sessionId - Session ID
+ * @returns 聚合统计数据，如果 session 不存在返回 null
+ */
+export async function aggregateSessionStats(
+  sessionId: string,
+  ownerUserId?: number
+): Promise<{
+  sessionId: string;
+  requestCount: number;
+  totalCostUsd: string;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheCreationTokens: number;
+  totalCacheReadTokens: number;
+  totalDurationMs: number;
+  firstRequestAt: Date | null;
+  lastRequestAt: Date | null;
+  providers: Array<{ id: number; name: string }>;
+  models: string[];
+  userName: string;
+  userId: number;
+  keyName: string;
+  keyId: number;
+  userAgent: string | null;
+  apiType: string | null;
+  cacheTtlApplied: string | null;
+} | null> {
+  // 1. 聚合统计（从 usageLedger 读取，warmup 已在触发器层面排除）
+  const [stats] = await db
+    .select({
+      requestCount: sql<number>`count(*)::double precision`,
+      totalCostUsd: sql<string>`COALESCE(sum(${usageLedger.costUsd}), 0)`,
+      totalInputTokens: sql<number>`COALESCE(sum(${usageLedger.inputTokens})::double precision, 0::double precision)`,
+      totalOutputTokens: sql<number>`COALESCE(sum(${usageLedger.outputTokens})::double precision, 0::double precision)`,
+      totalCacheCreationTokens: sql<number>`COALESCE(sum(${usageLedger.cacheCreationInputTokens})::double precision, 0::double precision)`,
+      totalCacheReadTokens: sql<number>`COALESCE(sum(${usageLedger.cacheReadInputTokens})::double precision, 0::double precision)`,
+      totalDurationMs: sql<number>`COALESCE(sum(${usageLedger.durationMs})::double precision, 0::double precision)`,
+      firstRequestAt: sql<Date>`min(${usageLedger.createdAt})`,
+      lastRequestAt: sql<Date>`max(${usageLedger.createdAt})`,
+    })
+    .from(usageLedger)
+    .where(and(ledgerSessionLookupForOwner(sessionId, ownerUserId), LEDGER_BILLING_CONDITION));
+
+  const billingStats = stats ?? {
+    requestCount: 0,
+    totalCostUsd: "0",
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalCacheCreationTokens: 0,
+    totalCacheReadTokens: 0,
+    totalDurationMs: 0,
+    firstRequestAt: null,
+    lastRequestAt: null,
+  };
+
+  // 2. 查询供应商列表（去重）
+  const providerList = await db
+    .selectDistinct({
+      providerId: usageLedger.finalProviderId,
+      providerName: providers.name,
+    })
+    .from(usageLedger)
+    .leftJoin(providers, eq(usageLedger.finalProviderId, providers.id))
+    .where(
+      and(
+        ledgerSessionLookupForOwner(sessionId, ownerUserId),
+        LEDGER_BILLING_CONDITION,
+        sql`${usageLedger.finalProviderId} IS NOT NULL`
+      )
+    );
+
+  // 3. 查询模型列表（去重）
+  const modelList = await db
+    .selectDistinct({ model: usageLedger.model })
+    .from(usageLedger)
+    .where(
+      and(
+        ledgerSessionLookupForOwner(sessionId, ownerUserId),
+        LEDGER_BILLING_CONDITION,
+        sql`${usageLedger.model} IS NOT NULL`
+      )
+    );
+
+  // 3.1 查询 Cache TTL 列表（去重）
+  const cacheTtlList = await db
+    .selectDistinct({ cacheTtl: usageLedger.cacheTtlApplied })
+    .from(usageLedger)
+    .where(
+      and(
+        ledgerSessionLookupForOwner(sessionId, ownerUserId),
+        LEDGER_BILLING_CONDITION,
+        sql`${usageLedger.cacheTtlApplied} IS NOT NULL`
+      )
+    );
+
+  // 聚合 Cache TTL：单一值直接返回，多值返回 "mixed"
+  const uniqueCacheTtls = cacheTtlList.map((c) => c.cacheTtl).filter(Boolean) as string[];
+  const cacheTtlApplied =
+    uniqueCacheTtls.length === 0
+      ? null
+      : uniqueCacheTtls.length === 1
+        ? uniqueCacheTtls[0]
+        : "mixed";
+
+  // 4. 获取用户信息（第一条请求）
+  const [userInfo] = await db
+    .select({
+      userName: users.name,
+      userId: users.id,
+      keyName: keysTable.name,
+      keyId: keysTable.id,
+      userAgent: messageRequest.userAgent,
+      apiType: messageRequest.apiType,
+    })
+    .from(messageRequest)
+    .innerJoin(users, eq(messageRequest.userId, users.id))
+    .innerJoin(keysTable, eq(messageRequest.key, keysTable.key))
+    .where(and(messageSessionLookup(sessionId, ownerUserId), isNull(messageRequest.deletedAt)))
+    .orderBy(messageRequest.createdAt)
+    .limit(1);
+
+  if (!userInfo) {
+    return null;
+  }
+
+  return {
+    sessionId,
+    requestCount: billingStats.requestCount,
+    totalCostUsd: billingStats.totalCostUsd,
+    totalInputTokens: billingStats.totalInputTokens,
+    totalOutputTokens: billingStats.totalOutputTokens,
+    totalCacheCreationTokens: billingStats.totalCacheCreationTokens,
+    totalCacheReadTokens: billingStats.totalCacheReadTokens,
+    totalDurationMs: billingStats.totalDurationMs,
+    firstRequestAt: billingStats.firstRequestAt,
+    lastRequestAt: billingStats.lastRequestAt,
+    providers: providerList.map((p) => ({
+      id: p.providerId!,
+      name: p.providerName || `Provider #${p.providerId}`,
+    })),
+    models: modelList.map((m) => m.model!),
+    userName: userInfo.userName,
+    userId: userInfo.userId,
+    keyName: userInfo.keyName,
+    keyId: userInfo.keyId,
+    userAgent: userInfo.userAgent,
+    apiType: userInfo.apiType,
+    cacheTtlApplied,
+  };
+}
+
+/** 解析活跃 Session identity 到可查看的物理 Session/前缀绑定信息。 */
+export async function resolveSessionIdentity(
+  identity: string,
+  ownerUserId?: number
+): Promise<{
+  identity: string;
+  sourceSessionId: string | null;
+  identityKind: "session_id" | "prefix_affinity" | null;
+  scopeTag: string | null;
+  fingerprint: string | null;
+  fingerprints: string[];
+} | null> {
+  const rows = await db
+    .select({
+      identity: messageSessionIdentity,
+      sessionId: messageRequest.sessionId,
+      identityKind: messageRequest.sessionIdentityKind,
+      scopeTag: messageRequest.affinityScopeTag,
+      fingerprint: messageRequest.affinityFingerprint,
+      fingerprintChain: messageRequest.affinityFingerprintChain,
+    })
+    .from(messageRequest)
+    .where(
+      and(messageCanonicalSessionLookup(identity, ownerUserId), isNull(messageRequest.deletedAt))
+    )
+    .orderBy(desc(messageRequest.createdAt));
+
+  if (rows.length === 0) return null;
+
+  const fingerprints = new Set<string>();
+  for (const row of rows) {
+    if (row.fingerprint) fingerprints.add(row.fingerprint);
+    if (Array.isArray(row.fingerprintChain)) {
+      for (const fingerprint of row.fingerprintChain) {
+        if (typeof fingerprint === "string" && fingerprint) fingerprints.add(fingerprint);
+      }
+    }
+  }
+
+  const identityKinds = new Set(
+    rows.map((row) => (row.identityKind === "prefix_affinity" ? "prefix_affinity" : "session_id"))
+  );
+
+  return {
+    identity: rows[0]?.identity ?? identity,
+    sourceSessionId: rows.find((row) => row.sessionId)?.sessionId ?? null,
+    identityKind: identityKinds.size === 1 ? ([...identityKinds][0] ?? null) : null,
+    scopeTag: rows.find((row) => row.scopeTag)?.scopeTag ?? null,
+    fingerprint: rows.find((row) => row.fingerprint)?.fingerprint ?? null,
+    fingerprints: [...fingerprints],
+  };
+}
+
+export type PhysicalSessionSource = {
+  sessionId: string;
+  userId: number;
+  keyId: number;
+  providerIds: number[];
+};
+
+/** Enumerate the physical Session and Provider memberships owned by a public identity. */
+export async function listPhysicalSessionSourcesForIdentity(
+  identity: string,
+  ownerUserId?: number
+): Promise<PhysicalSessionSource[]> {
+  const rows = await db
+    .select({
+      sessionId: messageRequest.sessionId,
+      userId: messageRequest.userId,
+      keyId: keysTable.id,
+      providerId: messageRequest.providerId,
+      finalProviderId: sql<number | null>`COALESCE(
+        CASE
+          WHEN ${messageRequest.providerChain} IS NOT NULL
+            AND jsonb_typeof(${messageRequest.providerChain}) = 'array'
+            AND jsonb_array_length(${messageRequest.providerChain}) > 0
+            AND jsonb_typeof(${messageRequest.providerChain} -> -1) = 'object'
+            AND (${messageRequest.providerChain} -> -1 ? 'id')
+            AND (${messageRequest.providerChain} -> -1 ->> 'id') ~ '^[0-9]+$'
+          THEN (${messageRequest.providerChain} -> -1 ->> 'id')::integer
+          ELSE NULL
+        END,
+        ${messageRequest.providerId}
+      )`,
+    })
+    .from(messageRequest)
+    .innerJoin(keysTable, eq(messageRequest.key, keysTable.key))
+    .where(
+      and(
+        messageCanonicalSessionLookup(identity, ownerUserId),
+        isNotNull(messageRequest.sessionId),
+        eq(messageRequest.isReplay, false),
+        isNull(messageRequest.deletedAt),
+        sql`${messageSessionIdentity} = (
+          SELECT COALESCE(latest.session_identity, latest.session_id)
+          FROM message_request latest
+          WHERE latest.session_id = ${messageRequest.sessionId}
+            AND latest.user_id = ${messageRequest.userId}
+            AND latest.key = ${messageRequest.key}
+            AND latest.deleted_at IS NULL
+            AND latest.is_replay = false
+          ORDER BY latest.created_at DESC, latest.id DESC
+          LIMIT 1
+        )`
+      )
+    );
+
+  const sourcesBySessionAndKey = new Map<
+    string,
+    {
+      sessionId: string;
+      userId: number;
+      keyId: number;
+      providerIds: Set<number>;
+    }
+  >();
+  for (const row of rows) {
+    if (!row.sessionId) continue;
+    const sourceKey = JSON.stringify([row.sessionId, row.keyId]);
+    const source = sourcesBySessionAndKey.get(sourceKey) ?? {
+      sessionId: row.sessionId,
+      userId: row.userId,
+      keyId: row.keyId,
+      providerIds: new Set<number>(),
+    };
+    if (Number.isInteger(row.providerId) && row.providerId > 0) {
+      source.providerIds.add(row.providerId);
+    }
+    if (
+      typeof row.finalProviderId === "number" &&
+      Number.isInteger(row.finalProviderId) &&
+      row.finalProviderId > 0
+    ) {
+      source.providerIds.add(row.finalProviderId);
+    }
+    sourcesBySessionAndKey.set(sourceKey, source);
+  }
+
+  return [...sourcesBySessionAndKey.values()].map((source) => ({
+    sessionId: source.sessionId,
+    userId: source.userId,
+    keyId: source.keyId,
+    providerIds: [...source.providerIds],
+  }));
+}
+
+/** 验证物理 Session 是否属于指定的聚合 identity。 */
+export async function isSessionSourceForIdentity(
+  identity: string,
+  sourceSessionId: string,
+  ownerUserId?: number
+): Promise<boolean> {
+  const [row] = await db
+    .select({ id: messageRequest.id })
+    .from(messageRequest)
+    .where(
+      and(
+        messageCanonicalSessionLookup(identity, ownerUserId),
+        eq(messageRequest.sessionId, sourceSessionId),
+        isNull(messageRequest.deletedAt)
+      )
+    )
+    .limit(1);
+
+  return Boolean(row);
+}
+
+export async function findSessionRequestLocator(
+  identity: string,
+  selector: { requestId?: number; sourceSessionId?: string; requestSequence?: number } = {},
+  ownerUserId?: number
+): Promise<{
+  requestId: number;
+  canonicalSessionId: string;
+  sourceSessionId: string;
+  requestSequence: number;
+  keyId: number;
+  userId: number;
+  identityKind: "session_id" | "prefix_affinity";
+  scopeTag: string | null;
+  fingerprint: string | null;
+} | null> {
+  const [row] = await db
+    .select({
+      requestId: messageRequest.id,
+      canonicalSessionId: messageSessionIdentity,
+      sourceSessionId: messageRequest.sessionId,
+      requestSequence: messageRequest.requestSequence,
+      keyId: keysTable.id,
+      userId: messageRequest.userId,
+      identityKind: messageRequest.sessionIdentityKind,
+      scopeTag: messageRequest.affinityScopeTag,
+      fingerprint: messageRequest.affinityFingerprint,
+    })
+    .from(messageRequest)
+    .innerJoin(keysTable, eq(messageRequest.key, keysTable.key))
+    .where(
+      and(
+        selector.requestId !== undefined
+          ? messageSessionLookup(identity, ownerUserId)
+          : messageCanonicalSessionLookup(identity, ownerUserId),
+        isNotNull(messageRequest.sessionId),
+        isNotNull(messageRequest.requestSequence),
+        selector.requestId !== undefined ? eq(messageRequest.id, selector.requestId) : undefined,
+        selector.sourceSessionId
+          ? eq(messageRequest.sessionId, selector.sourceSessionId)
+          : undefined,
+        selector.requestSequence !== undefined
+          ? eq(messageRequest.requestSequence, selector.requestSequence)
+          : undefined,
+        isNull(messageRequest.deletedAt)
+      )
+    )
+    .orderBy(sql`${messageRequest.createdAt} DESC NULLS LAST`, desc(messageRequest.id))
+    .limit(1);
+
+  if (
+    !row?.requestId ||
+    !row.canonicalSessionId ||
+    !row.sourceSessionId ||
+    row.requestSequence == null ||
+    !row.keyId ||
+    !row.userId
+  ) {
+    return null;
+  }
+
+  return {
+    requestId: row.requestId,
+    canonicalSessionId: row.canonicalSessionId,
+    sourceSessionId: row.sourceSessionId,
+    requestSequence: row.requestSequence,
+    keyId: row.keyId,
+    userId: row.userId,
+    identityKind: row.identityKind === "prefix_affinity" ? "prefix_affinity" : "session_id",
+    scopeTag: row.scopeTag,
+    fingerprint: row.fingerprint,
+  };
+}
+
+/**
+ * 批量聚合多个 session 的统计数据（性能优化版本）
+ *
+ * 使用单次 SQL 查询获取所有 session 的聚合数据，避免 N+1 查询问题
+ *
+ * @param sessionIds - Session ID 列表
+ * @returns 聚合统计数据数组
+ */
+export async function aggregateMultipleSessionStats(
+  sessionIds: string[],
+  ownerUserId?: number
+): Promise<
+  Array<{
+    sessionId: string;
+    requestedSessionIds?: string[];
+    sessionIdentityKind: "session_id" | "prefix_affinity";
+    sessionFingerprint: string | null;
+    requestCount: number;
+    totalCostUsd: string;
+    totalInputTokens: number;
+    totalOutputTokens: number;
+    totalCacheCreationTokens: number;
+    totalCacheReadTokens: number;
+    totalDurationMs: number;
+    firstRequestAt: Date | null;
+    lastRequestAt: Date | null;
+    providers: Array<{ id: number; name: string }>;
+    models: string[];
+    userName: string;
+    userId: number;
+    keyName: string;
+    keyId: number;
+    userAgent: string | null;
+    apiType: string | null;
+    cacheTtlApplied: string | null;
+  }>
+> {
+  if (sessionIds.length === 0) {
+    return [];
+  }
+
+  // 1. Resolve physical Session IDs to their canonical public identity before ledger aggregation.
+  const sessionIdParams = sql.join(
+    sessionIds.map((id) => sql`${id}`),
+    sql.raw(", ")
+  );
+  const ownerCondition = ownerUserId !== undefined ? sql`AND user_id = ${ownerUserId}` : sql``;
+  const userInfoRows = await db.execute(sql`
+    SELECT
+      sid AS requested_session_id,
+      COALESCE(mr.session_identity, mr.session_id) AS session_id,
+      u.name AS user_name,
+      u.id AS user_id,
+      k.name AS key_name,
+      k.id AS key_id,
+      CASE
+        WHEN mr.session_identity_kind = 'prefix_affinity' THEN 'prefix_affinity'
+        ELSE 'session_id'
+      END AS session_identity_kind,
+      mr.affinity_fingerprint AS session_fingerprint,
+      mr.user_agent,
+      mr.api_type
+    FROM unnest(ARRAY[${sessionIdParams}]::varchar[]) WITH ORDINALITY AS requested(sid, ordinality)
+    CROSS JOIN LATERAL (
+      SELECT
+        id,
+        session_id,
+        session_identity,
+        user_id,
+        key,
+        session_identity_kind,
+        affinity_fingerprint,
+        user_agent,
+        api_type
+      FROM (
+        SELECT
+          id,
+          session_id,
+          session_identity,
+          user_id,
+          key,
+          session_identity_kind,
+          affinity_fingerprint,
+          user_agent,
+          api_type,
+          created_at,
+          CASE WHEN session_identity = sid THEN 0 ELSE 1 END AS identity_priority
+        FROM message_request
+        WHERE COALESCE(session_identity, session_id) = sid
+          AND deleted_at IS NULL
+          ${ownerCondition}
+
+        UNION ALL
+
+        SELECT
+          id,
+          session_id,
+          session_identity,
+          user_id,
+          key,
+          session_identity_kind,
+          affinity_fingerprint,
+          user_agent,
+          api_type,
+          created_at,
+          1 AS identity_priority
+        FROM message_request
+        WHERE sid NOT LIKE 'pfx:%'
+          AND sid NOT LIKE 'sid:%'
+          AND session_identity IS NOT NULL
+          AND session_identity <> sid
+          AND session_id = sid
+          AND deleted_at IS NULL
+          ${ownerCondition}
+      ) candidates
+      ORDER BY
+        identity_priority,
+        created_at DESC NULLS LAST,
+        id DESC
+      LIMIT 1
+    ) mr
+    INNER JOIN users u ON mr.user_id = u.id
+    INNER JOIN keys k ON mr.key = k.key
+    ORDER BY ordinality
+  `);
+
+  const canonicalByRequested = new Map<string, string>();
+  const userInfoMap = new Map<
+    string,
+    {
+      sessionId: string;
+      requestedSessionIds: string[];
+      sessionIdentityKind: "session_id" | "prefix_affinity";
+      sessionFingerprint: string | null;
+      userName: string;
+      userId: number;
+      keyName: string;
+      keyId: number;
+      userAgent: string | null;
+      apiType: string | null;
+    }
+  >();
+  for (const row of Array.from(userInfoRows) as Array<{
+    requested_session_id: string;
+    session_id: string;
+    user_name: string;
+    user_id: number;
+    key_name: string;
+    key_id: number;
+    session_identity_kind: "session_id" | "prefix_affinity";
+    session_fingerprint: string | null;
+    user_agent: string | null;
+    api_type: string | null;
+  }>) {
+    canonicalByRequested.set(row.requested_session_id, row.session_id);
+    const existing = userInfoMap.get(row.session_id);
+    if (!existing) {
+      userInfoMap.set(row.session_id, {
+        sessionId: row.session_id,
+        requestedSessionIds: [row.requested_session_id],
+        userName: row.user_name,
+        userId: row.user_id,
+        keyName: row.key_name,
+        keyId: row.key_id,
+        sessionIdentityKind: row.session_identity_kind,
+        sessionFingerprint: row.session_fingerprint,
+        userAgent: row.user_agent,
+        apiType: row.api_type,
+      });
+    } else if (!existing.requestedSessionIds.includes(row.requested_session_id)) {
+      existing.requestedSessionIds.push(row.requested_session_id);
+    }
+  }
+
+  const canonicalSessionIds: string[] = [];
+  const seenCanonicalIds = new Set<string>();
+  for (const requestedSessionId of sessionIds) {
+    const canonicalSessionId = canonicalByRequested.get(requestedSessionId);
+    if (!canonicalSessionId || seenCanonicalIds.has(canonicalSessionId)) continue;
+    seenCanonicalIds.add(canonicalSessionId);
+    canonicalSessionIds.push(canonicalSessionId);
+  }
+
+  if (canonicalSessionIds.length === 0) {
+    return [];
+  }
+
+  const canonicalOwnerCondition = or(
+    ...canonicalSessionIds.map((canonicalSessionId) => {
+      const owner = userInfoMap.get(canonicalSessionId)?.userId;
+      return owner === undefined
+        ? undefined
+        : ledgerCanonicalSessionLookup(canonicalSessionId, owner);
+    })
+  );
+
+  // 2. 批量聚合统计（从 usageLedger，单次查询）
+  const statsResults = await db
+    .select({
+      sessionId: ledgerSessionIdentity,
+      requestCount: sql<number>`count(*)::double precision`,
+      totalCostUsd: sql<string>`COALESCE(sum(${usageLedger.costUsd}), 0)`,
+      totalInputTokens: sql<number>`COALESCE(sum(${usageLedger.inputTokens})::double precision, 0::double precision)`,
+      totalOutputTokens: sql<number>`COALESCE(sum(${usageLedger.outputTokens})::double precision, 0::double precision)`,
+      totalCacheCreationTokens: sql<number>`COALESCE(sum(${usageLedger.cacheCreationInputTokens})::double precision, 0::double precision)`,
+      totalCacheReadTokens: sql<number>`COALESCE(sum(${usageLedger.cacheReadInputTokens})::double precision, 0::double precision)`,
+      totalDurationMs: sql<number>`COALESCE(sum(${usageLedger.durationMs})::double precision, 0::double precision)`,
+      firstRequestAt: sql<Date>`min(${usageLedger.createdAt})`,
+      lastRequestAt: sql<Date>`max(${usageLedger.createdAt})`,
+    })
+    .from(usageLedger)
+    .where(and(canonicalOwnerCondition, LEDGER_BILLING_CONDITION))
+    .groupBy(ledgerSessionIdentity);
+
+  // 创建 sessionId → stats 的 Map
+  const statsMap = new Map(statsResults.map((s) => [s.sessionId, s]));
+
+  // 3. 批量查询供应商列表（按 session 分组）
+  const providerResults = await db
+    .selectDistinct({
+      sessionId: ledgerSessionIdentity,
+      providerId: usageLedger.finalProviderId,
+      providerName: providers.name,
+    })
+    .from(usageLedger)
+    .leftJoin(providers, eq(usageLedger.finalProviderId, providers.id))
+    .where(
+      and(
+        canonicalOwnerCondition,
+        LEDGER_BILLING_CONDITION,
+        sql`${usageLedger.finalProviderId} IS NOT NULL`
+      )
+    );
+
+  // 创建 sessionId → providers 的 Map
+  const providersMap = new Map<string, Array<{ id: number; name: string }>>();
+  for (const p of providerResults) {
+    // 跳过 null sessionId（虽然 WHERE 条件已过滤，但需要满足 TypeScript 类型检查）
+    if (!p.sessionId) continue;
+
+    if (!providersMap.has(p.sessionId)) {
+      providersMap.set(p.sessionId, []);
+    }
+    providersMap.get(p.sessionId)?.push({
+      id: p.providerId!,
+      name: p.providerName || `Provider #${p.providerId}`,
+    });
+  }
+
+  // 4. 批量查询模型列表（按 session 分组）
+  const modelResults = await db
+    .selectDistinct({
+      sessionId: ledgerSessionIdentity,
+      model: usageLedger.model,
+    })
+    .from(usageLedger)
+    .where(
+      and(canonicalOwnerCondition, LEDGER_BILLING_CONDITION, sql`${usageLedger.model} IS NOT NULL`)
+    );
+
+  // 创建 sessionId → models 的 Map
+  const modelsMap = new Map<string, string[]>();
+  for (const m of modelResults) {
+    // 跳过 null sessionId（虽然 WHERE 条件已过滤，但需要满足 TypeScript 类型检查）
+    if (!m.sessionId) continue;
+
+    if (!modelsMap.has(m.sessionId)) {
+      modelsMap.set(m.sessionId, []);
+    }
+    modelsMap.get(m.sessionId)?.push(m.model!);
+  }
+
+  // 5. 批量查询 Cache TTL 列表（按 session 分组）
+  const cacheTtlResults = await db
+    .selectDistinct({
+      sessionId: ledgerSessionIdentity,
+      cacheTtl: usageLedger.cacheTtlApplied,
+    })
+    .from(usageLedger)
+    .where(
+      and(
+        canonicalOwnerCondition,
+        LEDGER_BILLING_CONDITION,
+        sql`${usageLedger.cacheTtlApplied} IS NOT NULL`
+      )
+    );
+
+  // 创建 sessionId → cacheTtls 的 Map
+  const cacheTtlMap = new Map<string, string[]>();
+  for (const c of cacheTtlResults) {
+    if (!c.sessionId) continue;
+
+    if (!cacheTtlMap.has(c.sessionId)) {
+      cacheTtlMap.set(c.sessionId, []);
+    }
+    if (c.cacheTtl) {
+      cacheTtlMap.get(c.sessionId)?.push(c.cacheTtl);
+    }
+  }
+
+  // 6. 组装最终结果
+  const results: Awaited<ReturnType<typeof aggregateMultipleSessionStats>> = [];
+
+  for (const sessionId of canonicalSessionIds) {
+    const stats = statsMap.get(sessionId);
+    const userInfo = userInfoMap.get(sessionId);
+
+    // 跳过没有数据的 session
+    if (!userInfo) {
+      continue;
+    }
+
+    const billingStats = stats ?? {
+      requestCount: 0,
+      totalCostUsd: "0",
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalCacheCreationTokens: 0,
+      totalCacheReadTokens: 0,
+      totalDurationMs: 0,
+      firstRequestAt: null,
+      lastRequestAt: null,
+    };
+
+    results.push({
+      sessionId,
+      requestedSessionIds: userInfo.requestedSessionIds,
+      sessionIdentityKind: userInfo.sessionIdentityKind,
+      sessionFingerprint: userInfo.sessionFingerprint,
+      requestCount: billingStats.requestCount,
+      totalCostUsd: billingStats.totalCostUsd,
+      totalInputTokens: billingStats.totalInputTokens,
+      totalOutputTokens: billingStats.totalOutputTokens,
+      totalCacheCreationTokens: billingStats.totalCacheCreationTokens,
+      totalCacheReadTokens: billingStats.totalCacheReadTokens,
+      totalDurationMs: billingStats.totalDurationMs,
+      firstRequestAt: billingStats.firstRequestAt,
+      lastRequestAt: billingStats.lastRequestAt,
+      providers: providersMap.get(sessionId) || [],
+      models: modelsMap.get(sessionId) || [],
+      userName: userInfo.userName,
+      userId: userInfo.userId,
+      keyName: userInfo.keyName,
+      keyId: userInfo.keyId,
+      userAgent: userInfo.userAgent,
+      apiType: userInfo.apiType,
+      cacheTtlApplied: (() => {
+        const ttls = cacheTtlMap.get(sessionId) || [];
+        if (ttls.length === 0) return null;
+        if (ttls.length === 1) return ttls[0];
+        return "mixed";
+      })(),
+    });
+  }
+
+  return results;
+}
+
+/**
+ * 查询使用日志（支持分页、时间筛选、模型筛选）
+ */
+export async function findUsageLogs(params: {
+  userId?: number;
+  startDate?: Date;
+  endDate?: Date;
+  model?: string;
+  page?: number;
+  pageSize?: number;
+}): Promise<{ logs: MessageRequest[]; total: number }> {
+  const { userId, startDate, endDate, model, page = 1, pageSize = 50 } = params;
+
+  const conditions = [isNull(messageRequest.deletedAt)];
+
+  if (userId !== undefined) {
+    conditions.push(eq(messageRequest.userId, userId));
+  }
+
+  const startIso = startDate?.toISOString();
+  const endIso = endDate?.toISOString();
+
+  if (startIso) {
+    conditions.push(sql`${messageRequest.createdAt} >= ${startIso}::timestamptz`);
+  }
+
+  if (endIso) {
+    conditions.push(sql`${messageRequest.createdAt} <= ${endIso}::timestamptz`);
+  }
+
+  if (model) {
+    conditions.push(eq(messageRequest.model, model));
+  }
+
+  // 查询总数
+  const [countResult] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(messageRequest)
+    .where(and(...conditions));
+
+  const total = countResult?.count ?? 0;
+
+  // 查询分页数据
+  const offset = (page - 1) * pageSize;
+  const results = await db
+    .select()
+    .from(messageRequest)
+    .where(and(...conditions))
+    .orderBy(desc(messageRequest.createdAt))
+    .limit(pageSize)
+    .offset(offset);
+
+  const logs = results.map(toMessageRequest);
+
+  if (logs.length > 0) {
+    return { logs, total };
+  }
+
+  if (!(await isLedgerOnlyMode())) {
+    return { logs, total };
+  }
+
+  const ledgerConditions = [LEDGER_AUDIT_CONDITION];
+
+  if (userId !== undefined) {
+    ledgerConditions.push(eq(usageLedger.userId, userId));
+  }
+
+  if (startIso) {
+    ledgerConditions.push(sql`${usageLedger.createdAt} >= ${startIso}::timestamptz`);
+  }
+
+  if (endIso) {
+    ledgerConditions.push(sql`${usageLedger.createdAt} <= ${endIso}::timestamptz`);
+  }
+
+  if (model) {
+    ledgerConditions.push(eq(usageLedger.model, model));
+  }
+
+  const [ledgerCountResult] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(usageLedger)
+    .where(and(...ledgerConditions));
+
+  const ledgerTotal = ledgerCountResult?.count ?? 0;
+
+  const ledgerResults = await db
+    .select({
+      requestId: usageLedger.requestId,
+      finalProviderId: usageLedger.finalProviderId,
+      userId: usageLedger.userId,
+      key: usageLedger.key,
+      model: usageLedger.model,
+      originalModel: usageLedger.originalModel,
+      endpoint: usageLedger.endpoint,
+      statusCode: usageLedger.statusCode,
+      costUsd: usageLedger.costUsd,
+      costMultiplier: usageLedger.costMultiplier,
+      inputTokens: usageLedger.inputTokens,
+      outputTokens: usageLedger.outputTokens,
+      cacheCreationInputTokens: usageLedger.cacheCreationInputTokens,
+      cacheReadInputTokens: usageLedger.cacheReadInputTokens,
+      cacheCreation5mInputTokens: usageLedger.cacheCreation5mInputTokens,
+      cacheCreation1hInputTokens: usageLedger.cacheCreation1hInputTokens,
+      cacheTtlApplied: usageLedger.cacheTtlApplied,
+      context1mApplied: usageLedger.context1mApplied,
+      swapCacheTtlApplied: usageLedger.swapCacheTtlApplied,
+      durationMs: usageLedger.durationMs,
+      ttftMs: usageLedger.ttftMs,
+      firstByteMs: usageLedger.firstByteMs,
+      sessionId: usageLedger.sessionId,
+      isReplay: usageLedger.isReplay,
+      replaySourceRequestId: usageLedger.replaySourceRequestId,
+      createdAt: usageLedger.createdAt,
+    })
+    .from(usageLedger)
+    .where(and(...ledgerConditions))
+    .orderBy(desc(usageLedger.createdAt), desc(usageLedger.requestId))
+    .limit(pageSize)
+    .offset(offset);
+
+  const ledgerLogs = ledgerResults.map((row) =>
+    toMessageRequest({
+      id: row.requestId,
+      providerId: row.finalProviderId,
+      userId: row.userId,
+      key: row.key,
+      model: row.model,
+      originalModel: row.originalModel,
+      durationMs: row.durationMs,
+      ttftMs: row.ttftMs,
+      firstByteMs: row.firstByteMs,
+      costUsd: row.costUsd,
+      costMultiplier: row.costMultiplier,
+      sessionId: row.sessionId,
+      isReplay: row.isReplay,
+      replaySourceRequestId: row.replaySourceRequestId,
+      userAgent: null,
+      endpoint: row.endpoint,
+      messagesCount: null,
+      statusCode: row.statusCode,
+      inputTokens: row.inputTokens,
+      outputTokens: row.outputTokens,
+      cacheCreationInputTokens: row.cacheCreationInputTokens,
+      cacheReadInputTokens: row.cacheReadInputTokens,
+      cacheCreation5mInputTokens: row.cacheCreation5mInputTokens,
+      cacheCreation1hInputTokens: row.cacheCreation1hInputTokens,
+      cacheTtlApplied: row.cacheTtlApplied,
+      errorMessage: null,
+      providerChain: null,
+      routingTrace: null,
+      blockedBy: null,
+      blockedReason: null,
+      context1mApplied: row.context1mApplied,
+      swapCacheTtlApplied: row.swapCacheTtlApplied,
+      specialSettings: null,
+      createdAt: row.createdAt,
+      updatedAt: row.createdAt,
+      deletedAt: null,
+    })
+  );
+
+  return { logs: ledgerLogs, total: ledgerTotal };
+}
+
+/**
+ * 查询指定 Session 的所有请求记录（用于 Session 详情页的请求列表）
+ *
+ * @param sessionId - Session ID
+ * @param options - 分页参数
+ * @returns 请求列表和总数
+ */
+export async function findRequestsBySessionId(
+  sessionId: string,
+  options?: { limit?: number; offset?: number; order?: "asc" | "desc" }
+): Promise<{
+  requests: Array<{
+    id: number;
+    sourceSessionId: string;
+    sequence: number;
+    displaySequence: number;
+    model: string | null;
+    statusCode: number | null;
+    costUsd: string | null;
+    createdAt: Date | null;
+    inputTokens: number | null;
+    outputTokens: number | null;
+    errorMessage: string | null;
+  }>;
+  total: number;
+}> {
+  const { limit = 20, offset = 0, order = "asc" } = options || {};
+
+  // 查询总数
+  const [countResult] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(messageRequest)
+    .where(
+      and(
+        eq(messageRequest.sessionId, sessionId),
+        isNotNull(messageRequest.requestSequence),
+        isNull(messageRequest.deletedAt)
+      )
+    );
+
+  const total = countResult?.count ?? 0;
+
+  // 查询分页数据，按 requestSequence 排序（支持正序/倒序）
+  const results = await db
+    .select({
+      id: messageRequest.id,
+      sessionId: messageRequest.sessionId,
+      sequence: messageRequest.requestSequence,
+      displaySequence: sql<number>`COALESCE(
+        ${messageRequest.requestSequence},
+        row_number() OVER (ORDER BY ${messageRequest.createdAt} ASC, ${messageRequest.id} ASC)::int
+      )`,
+      model: messageRequest.model,
+      statusCode: messageRequest.statusCode,
+      costUsd: messageRequest.costUsd,
+      createdAt: messageRequest.createdAt,
+      inputTokens: messageRequest.inputTokens,
+      outputTokens: messageRequest.outputTokens,
+      errorMessage: messageRequest.errorMessage,
+    })
+    .from(messageRequest)
+    .where(
+      and(
+        eq(messageRequest.sessionId, sessionId),
+        isNotNull(messageRequest.requestSequence),
+        isNull(messageRequest.deletedAt)
+      )
+    )
+    .orderBy(
+      order === "asc" ? asc(messageRequest.requestSequence) : desc(messageRequest.requestSequence)
+    )
+    .limit(limit)
+    .offset(offset);
+
+  return {
+    requests: results.map((r) => ({
+      id: r.id,
+      sourceSessionId: r.sessionId ?? sessionId,
+      sequence: r.sequence ?? 1,
+      displaySequence: r.displaySequence,
+      model: r.model,
+      statusCode: r.statusCode,
+      costUsd: r.costUsd,
+      createdAt: r.createdAt,
+      inputTokens: r.inputTokens,
+      outputTokens: r.outputTokens,
+      errorMessage: r.errorMessage,
+    })),
+    total,
+  };
+}
+
+export async function findRequestsBySessionIdentity(
+  identity: string,
+  options?: {
+    limit?: number;
+    offset?: number;
+    order?: "asc" | "desc";
+    ownerUserId?: number;
+  }
+): Promise<Awaited<ReturnType<typeof findRequestsBySessionId>>> {
+  const { limit = 20, offset = 0, order = "desc", ownerUserId } = options || {};
+  const where = and(
+    messageCanonicalSessionLookup(identity, ownerUserId),
+    isNotNull(messageRequest.sessionId),
+    isNotNull(messageRequest.requestSequence),
+    eq(messageRequest.isReplay, false),
+    isNull(messageRequest.deletedAt)
+  );
+  const [countResult] = await db
+    .select({ count: sql<number>`count(*)::int` })
+    .from(messageRequest)
+    .where(where);
+  const results = await db
+    .select({
+      id: messageRequest.id,
+      sessionId: messageRequest.sessionId,
+      sequence: messageRequest.requestSequence,
+      displaySequence: sql<number>`CASE
+        WHEN ${messageRequest.sessionIdentityKind} = 'prefix_affinity'
+        THEN row_number() OVER (
+          ORDER BY ${messageRequest.createdAt} ASC, ${messageRequest.id} ASC
+        )::int
+        ELSE COALESCE(
+          ${messageRequest.requestSequence},
+          row_number() OVER (ORDER BY ${messageRequest.createdAt} ASC, ${messageRequest.id} ASC)::int
+        )
+      END`,
+      model: messageRequest.model,
+      statusCode: messageRequest.statusCode,
+      costUsd: messageRequest.costUsd,
+      createdAt: messageRequest.createdAt,
+      inputTokens: messageRequest.inputTokens,
+      outputTokens: messageRequest.outputTokens,
+      errorMessage: messageRequest.errorMessage,
+    })
+    .from(messageRequest)
+    .where(where)
+    .orderBy(
+      order === "asc"
+        ? asc(messageRequest.createdAt)
+        : sql`${messageRequest.createdAt} DESC NULLS LAST`,
+      order === "asc" ? asc(messageRequest.id) : desc(messageRequest.id)
+    )
+    .limit(limit)
+    .offset(offset);
+
+  return {
+    requests: results.flatMap((row) =>
+      row.sessionId
+        ? [
+            {
+              id: row.id,
+              sourceSessionId: row.sessionId,
+              sequence: row.sequence ?? 1,
+              displaySequence: row.displaySequence,
+              model: row.model,
+              statusCode: row.statusCode,
+              costUsd: row.costUsd,
+              createdAt: row.createdAt,
+              inputTokens: row.inputTokens,
+              outputTokens: row.outputTokens,
+              errorMessage: row.errorMessage,
+            },
+          ]
+        : []
+    ),
+    total: countResult?.count ?? 0,
+  };
+}
+
+export async function findAdjacentRequestSequences(
+  sessionId: string,
+  sequence: number
+): Promise<{ prevSequence: number | null; nextSequence: number | null }> {
+  const [prev] = await db
+    .select({
+      sequence: sql<number | null>`max(${messageRequest.requestSequence})`,
+    })
+    .from(messageRequest)
+    .where(
+      and(
+        eq(messageRequest.sessionId, sessionId),
+        isNull(messageRequest.deletedAt),
+        lt(messageRequest.requestSequence, sequence)
+      )
+    );
+
+  const [next] = await db
+    .select({
+      sequence: sql<number | null>`min(${messageRequest.requestSequence})`,
+    })
+    .from(messageRequest)
+    .where(
+      and(
+        eq(messageRequest.sessionId, sessionId),
+        isNull(messageRequest.deletedAt),
+        gt(messageRequest.requestSequence, sequence)
+      )
+    );
+
+  return {
+    prevSequence: prev?.sequence ?? null,
+    nextSequence: next?.sequence ?? null,
+  };
+}
+
+export type SessionRequestNavigationTarget = {
+  requestId: number;
+  sourceSessionId: string;
+  requestSequence: number;
+};
+
+/** Resolve adjacent requests on the public Session timeline, including cross-source boundaries. */
+export async function findAdjacentSessionRequests(
+  identity: string,
+  requestId: number,
+  ownerUserId?: number
+): Promise<{
+  prevRequest: SessionRequestNavigationTarget | null;
+  nextRequest: SessionRequestNavigationTarget | null;
+}> {
+  const [current] = await db
+    .select({
+      requestId: messageRequest.id,
+      createdAt: messageRequest.createdAt,
+    })
+    .from(messageRequest)
+    .where(
+      and(
+        messageCanonicalSessionLookup(identity, ownerUserId),
+        eq(messageRequest.id, requestId),
+        eq(messageRequest.isReplay, false),
+        isNull(messageRequest.deletedAt)
+      )
+    )
+    .limit(1);
+
+  if (!current?.requestId || !current.createdAt) {
+    return { prevRequest: null, nextRequest: null };
+  }
+
+  const selection = {
+    requestId: messageRequest.id,
+    sourceSessionId: messageRequest.sessionId,
+    requestSequence: messageRequest.requestSequence,
+  };
+  const timelineFilter = and(
+    messageCanonicalSessionLookup(identity, ownerUserId),
+    isNotNull(messageRequest.sessionId),
+    isNotNull(messageRequest.requestSequence),
+    eq(messageRequest.isReplay, false),
+    isNull(messageRequest.deletedAt)
+  );
+
+  const [previous] = await db
+    .select(selection)
+    .from(messageRequest)
+    .where(
+      and(
+        timelineFilter,
+        or(
+          lt(messageRequest.createdAt, current.createdAt),
+          and(
+            eq(messageRequest.createdAt, current.createdAt),
+            lt(messageRequest.id, current.requestId)
+          )
+        )
+      )
+    )
+    .orderBy(sql`${messageRequest.createdAt} DESC NULLS LAST`, desc(messageRequest.id))
+    .limit(1);
+  const [next] = await db
+    .select(selection)
+    .from(messageRequest)
+    .where(
+      and(
+        timelineFilter,
+        or(
+          gt(messageRequest.createdAt, current.createdAt),
+          and(
+            eq(messageRequest.createdAt, current.createdAt),
+            gt(messageRequest.id, current.requestId)
+          )
+        )
+      )
+    )
+    .orderBy(asc(messageRequest.createdAt), asc(messageRequest.id))
+    .limit(1);
+
+  const toTarget = (
+    row: typeof previous | typeof next | undefined
+  ): SessionRequestNavigationTarget | null => {
+    if (!row?.requestId || !row.sourceSessionId || row.requestSequence == null) return null;
+    return {
+      requestId: row.requestId,
+      sourceSessionId: row.sourceSessionId,
+      requestSequence: row.requestSequence,
+    };
+  };
+
+  return {
+    prevRequest: toTarget(previous),
+    nextRequest: toTarget(next),
+  };
+}
