@@ -4,6 +4,7 @@ import { type Locale, localeCookieName } from "@/i18n/config";
 import { getLocaleFromValue, normalizePathnameForLocaleNavigation } from "@/i18n/pathname";
 import { routing } from "@/i18n/routing";
 import { AUTH_COOKIE_NAME } from "@/lib/auth";
+import { PORTAL_COOKIE_NAME } from "@/lib/auth/portal-cookie";
 import { isDevelopment } from "@/lib/config/env.schema";
 import { logger } from "@/lib/logger";
 
@@ -15,6 +16,14 @@ const PUBLIC_PATH_PATTERNS = [
   "/status",
   "/api/auth/login",
   "/api/auth/logout",
+  // Portal (end-user self-service) authenticates with its own cookie, not the
+  // admin auth-token this middleware checks. Its sign-in/sign-up pages must be
+  // reachable anonymously; the authenticated portal pages below guard
+  // themselves via getPortalSession() and must NOT be listed here.
+  "/portal/login",
+  "/portal/register",
+  "/api/auth/portal-login",
+  "/api/auth/register",
 ];
 
 const API_PROXY_PATH = "/v1";
@@ -97,7 +106,15 @@ function proxyHandler(request: NextRequest) {
   // by downstream layouts (dashboard/layout.tsx, etc.) which run in Node.js
   // runtime with guaranteed Redis/DB access. This avoids a death loop where
   // the proxy deletes the cookie on transient validation failures.
-  const authToken = sanitizedRequest.cookies.get(AUTH_COOKIE_NAME);
+  //
+  // Portal pages are a separate audience: they carry their own cookie and are
+  // validated by getPortalSession() in the page itself, so gate them on that
+  // cookie and send unauthenticated visitors to the portal sign-in, not the
+  // admin one.
+  const isPortalPath = matchesPublicPath(pathWithoutLocale, "/portal");
+  const authToken = isPortalPath
+    ? sanitizedRequest.cookies.get(PORTAL_COOKIE_NAME)
+    : sanitizedRequest.cookies.get(AUTH_COOKIE_NAME);
 
   if (!authToken) {
     // Not authenticated, redirect to login page
@@ -107,7 +124,7 @@ function proxyHandler(request: NextRequest) {
       sanitizedRequest.cookies.get(localeCookieName)?.value
     );
     const locale = isLocaleInPath ? potentialLocale : localeFromCookie || routing.defaultLocale;
-    url.pathname = `/${locale}/login`;
+    url.pathname = isPortalPath ? `/${locale}/portal/login` : `/${locale}/login`;
     url.searchParams.set("from", normalizePathnameForLocaleNavigation(pathWithoutLocale));
     return NextResponse.redirect(url);
   }

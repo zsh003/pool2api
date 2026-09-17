@@ -6,8 +6,9 @@ import bcrypt from "bcryptjs";
 import { getEnvConfig } from "@/lib/config/env.schema";
 import { logger } from "@/lib/logger";
 import type { Account } from "@/repository/account";
+import { PORTAL_COOKIE_NAME } from "./portal-cookie";
 
-export const PORTAL_COOKIE_NAME = "portal-auth-token";
+export { PORTAL_COOKIE_NAME } from "./portal-cookie";
 const BCRYPT_ROUNDS = 12;
 const TOKEN_VERSION = 1;
 

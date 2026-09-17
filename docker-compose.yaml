@@ -21,7 +21,7 @@ services:
     volumes:
       # 持久化数据库数据到本地 ./data/postgres 目录
       # 挂载到 /data 而不是 /var/lib/postgresql/data 避免权限冲突
-      - ./data/postgres:/data
+      - ${POOL2API_DATA_DIR:-./data}/postgres:/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-pool2api}"]
       interval: 5s
@@ -38,7 +38,7 @@ services:
     volumes:
       # 持久化 Redis 数据到本地 ./data/redis 目录
       # 使用 AOF 持久化模式,确保数据不丢失
-      - ./data/redis:/data
+      - ${POOL2API_DATA_DIR:-./data}/redis:/data
     command: redis-server --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
