@@ -96,7 +96,11 @@ export async function setPortalAuthCookie(token: string): Promise<void> {
   const cookieStore = await cookies();
   cookieStore.set(PORTAL_COOKIE_NAME, token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
+    // Follow the same switch as the admin cookie (src/lib/auth.ts). Keying this
+    // off NODE_ENV instead would mark the cookie Secure on any production
+    // build, and a browser served over plain HTTP silently drops it, leaving
+    // the user stuck on the sign-in screen.
+    secure: env.ENABLE_SECURE_COOKIES,
     sameSite: "lax",
     maxAge: ttl,
     path: "/",
